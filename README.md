@@ -5,6 +5,8 @@ A web crawler built in Rust, exposed as Model Context Protocl (MCP) server.
 ## Tools
 - `crawl_site` — crawls a URL up to a given depth and returns all visited URLs.
 
+- `fetch_content` — fetches the text content of a single URL
+
 ## Usage
 Build and run:
 ```bash
