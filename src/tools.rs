@@ -1,7 +1,7 @@
 use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
-use crate::crawler::{crawl, fetch_page};
+use crate::crawler::{crawl, fetch_page, extract_text, extract_text_md};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -37,8 +37,15 @@ impl Crawler {
     #[tool(description = "Fetch the content of a URL")]
     async fn fetch_content(&self, #[tool(aggr)] input: FetchInput) -> String {
         match fetch_page(&self.client, &input.url).await {
-            Ok(html) => html,
+            Ok(html) => extract_text(&html),
             Err(_)   => "Failed to fetch page".to_string(),
+        }
+    }
+    #[tool(description = "Fetch the content of a URL in .md format")]
+    async fn fetch_content_in_md(&self, #[tool(aggr)] input: FetchInput) -> String {
+        match fetch_page(&self.client, &input.url).await {
+            Ok(html) => extract_text_md(&html),
+            Err(_)   => "Failed to fetch page in markdown (.md)".to_string(),
         }
     }
 }

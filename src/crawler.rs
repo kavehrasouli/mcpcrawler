@@ -70,12 +70,16 @@ pub fn extract_text(html: &str) -> String {
     document
         .select(&selector)
         .next()                 // get the first match as Option<ElementRef>
-        .map(|x| x              // if body exists, extract its text
+       .map(|x| x              // if body exists, extract its text
             .text()             // iterator over all text nodes inside body
             .collect::<Vec<_>>()  // gather text nodes into a Vec
             .join(" ")          // join them into one String with spaces
         )
         .unwrap_or_default()    // if no body found, return empty String
+}
+
+pub fn extract_text_md(html: &str) -> String {
+    htmd::convert(html).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -88,7 +92,7 @@ mod tests {
     async fn test_crawl() {
         let client = Client::new();
         let visited = Arc::new(Mutex::new(Vec::new()));
-        crawl(&client, "https://apple.com", 2, visited.clone()).await;
+        crawl(&client, "https://kavehs.nl", 2, visited.clone()).await;
         let result = visited.lock().unwrap();
         println!("{:#?}", result);
         assert!(!result.is_empty());
@@ -99,6 +103,15 @@ mod tests {
         let client = Client::new();
         let html = fetch_page(&client, "https://apple.com").await.unwrap();
         let text = extract_text(&html);
+        println!("{}", text);
+        assert!(!text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_md() {
+        let client = Client::new();
+        let html   = fetch_page(&client, "https://apple.com").await.unwrap();
+        let text   = extract_text_md(&html);
         println!("{}", text);
         assert!(!text.is_empty());
     }
