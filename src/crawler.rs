@@ -63,6 +63,21 @@ visited: Arc<Mutex<Vec<String>>>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a
     })
 }
 
+pub fn extract_text(html: &str) -> String {
+    let document = Html::parse_document(html); // parse the raw HTML
+    let selector = Selector::parse("body").unwrap(); // build a CSS selector targeting <body>
+    // find the first <body> element in the document (there is only ever one!)
+    document
+        .select(&selector)
+        .next()                 // get the first match as Option<ElementRef>
+        .map(|x| x              // if body exists, extract its text
+            .text()             // iterator over all text nodes inside body
+            .collect::<Vec<_>>()  // gather text nodes into a Vec
+            .join(" ")          // join them into one String with spaces
+        )
+        .unwrap_or_default()    // if no body found, return empty String
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +92,14 @@ mod tests {
         let result = visited.lock().unwrap();
         println!("{:#?}", result);
         assert!(!result.is_empty());
+    }
+    
+    #[tokio::test]
+    async fn test_fetch() {
+        let client = Client::new();
+        let html = fetch_page(&client, "https://apple.com").await.unwrap();
+        let text = extract_text(&html);
+        println!("{}", text);
+        assert!(!text.is_empty());
     }
 }

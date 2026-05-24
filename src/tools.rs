@@ -1,7 +1,7 @@
 use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
-use crate::crawler::crawl;
+use crate::crawler::{crawl, fetch_page};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -12,11 +12,16 @@ pub struct CrawlInput {
     pub depth: u32,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FetchInput {
+    #[schemars(description = "The URL to fetch content from")]
+    pub url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Crawler {
     client: Client,
 }
-
 
 #[tool(tool_box)]
 impl Crawler {
@@ -25,9 +30,16 @@ impl Crawler {
     }
     #[tool(description = "Crawl a website and return all visited URLs")]
     async fn crawl_site(&self, #[tool(aggr)] input: CrawlInput) -> String {
-        let mut visited = Arc::new(Mutex::new(Vec::new()));
+        let visited = Arc::new(Mutex::new(Vec::new()));
         crawl(&self.client, &input.url, input.depth, visited.clone()).await;
         visited.lock().unwrap().join("\n") //implicit return
+    }
+    #[tool(description = "Fetch the content of a URL")]
+    async fn fetch_content(&self, #[tool(aggr)] input: FetchInput) -> String {
+        match fetch_page(&self.client, &input.url).await {
+            Ok(html) => html,
+            Err(_)   => "Failed to fetch page".to_string(),
+        }
     }
 }
 
