@@ -26,7 +26,12 @@ pub struct Crawler {
 #[tool(tool_box)]
 impl Crawler {
     pub fn new() -> Self {
-        Self {client: Client::new()}
+        Self {
+            client: Client::builder()
+                .user_agent("mcpcrawler/0.1")
+                .build()
+                .unwrap()
+        }
     }
     #[tool(description = "Crawl a website and return all visited URLs")]
     async fn crawl_site(&self, #[tool(aggr)] input: CrawlInput) -> String {

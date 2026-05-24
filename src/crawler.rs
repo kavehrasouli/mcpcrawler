@@ -88,20 +88,27 @@ mod tests {
     use reqwest::Client;
     use std::sync::{Arc, Mutex};
 
+    fn test_client() -> Client {
+        Client::builder()
+            .user_agent("mcpcrawler/0.1")
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_crawl() {
-        let client = Client::new();
+        let client = test_client();
         let visited = Arc::new(Mutex::new(Vec::new()));
         crawl(&client, "https://kavehs.nl", 2, visited.clone()).await;
         let result = visited.lock().unwrap();
         println!("{:#?}", result);
         assert!(!result.is_empty());
     }
-    
+
     #[tokio::test]
     async fn test_fetch() {
-        let client = Client::new();
-        let html = fetch_page(&client, "https://apple.com").await.unwrap();
+        let client = test_client();
+        let html = fetch_page(&client, "https://en.wikipedia.org/wiki/United_Nations_Security_Council_Resolution_2803").await.unwrap();
         let text = extract_text(&html);
         println!("{}", text);
         assert!(!text.is_empty());
@@ -110,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_md() {
         let client = Client::new();
-        let html   = fetch_page(&client, "https://apple.com").await.unwrap();
+        let html   = fetch_page(&client, "https://en.wikipedia.org/wiki/United_Nations_Security_Council_Resolution_2803").await.unwrap();
         let text   = extract_text_md(&html);
         println!("{}", text);
         assert!(!text.is_empty());
