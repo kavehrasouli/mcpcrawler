@@ -1,7 +1,7 @@
 use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
-use crate::crawler::{crawl, fetch_page, extract_text, extract_text_md};
+use crate::crawler::{crawl, fetch_page, extract_text, extract_text_md, search_site};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -10,6 +10,17 @@ pub struct CrawlInput {
     pub url: String,
     #[schemars(description = "How deep to follow links")]
     pub depth: u32,
+
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchInput {
+    #[schemars(description = "The URL to crawl")]
+    pub url: String,
+    #[schemars(description = "How deep to follow links")]
+    pub depth: u32,
+    #[schemars(description = "The keyword to search for")]
+    pub keyword: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -52,6 +63,12 @@ impl Crawler {
             Ok(html) => extract_text_md(&html),
             Err(_)   => "Failed to fetch page in markdown (.md)".to_string(),
         }
+    }
+    #[tool(description = "Crawl a website and return visited URLs containing a specific keyword")]
+    async fn search_site_keyword(&self, #[tool(aggr)] input: SearchInput) -> String {
+        search_site(&self.client, &input.url, input.depth, &input.keyword)
+            .await
+            .join("\n")
     }
 }
 

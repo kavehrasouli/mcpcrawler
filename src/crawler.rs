@@ -36,15 +36,19 @@ pub fn extract_links(html: &str, base_url: &str) -> Vec<String>
         .collect()
 }
 
-pub fn crawl<'a>(client: &'a Client, url: &'a str, depth: u32, 
-visited: Arc<Mutex<Vec<String>>>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-    let visited = Arc::clone(&visited);
-    Box::pin(async move {
-        if depth == 0 {return;}
-        {
-            let mut guard = visited.lock().unwrap();
-            if guard.contains(&url.to_string()) {return;}
-            guard.push(url.to_string());
+pub fn crawl<'a>(
+    client: &'a Client,     // HTTP client
+    url: &'a str,           // current URL to crawl
+    depth: u32,             // depth to follow links
+    visited: Arc<Mutex<Vec<String>>>    // shared list of URLs
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    let visited = Arc::clone(&visited); // make a clone for async block to own
+    Box::pin(async move {               // wrap in a pinned heap-allocated future
+        if depth == 0 {return;}         // base case
+        {   // open scope to control when the lock is dropped
+            let mut guard = visited.lock().unwrap();    // lock the mutex, get mutable access
+            if guard.contains(&url.to_string()) {return;}   // skip if already visited
+            guard.push(url.to_string());    // mark current URL as visited
         } // lock dropped here
 
         let html = match fetch_page(client, url).await {
@@ -63,6 +67,31 @@ visited: Arc<Mutex<Vec<String>>>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a
     })
 }
 
+pub async fn search_site(
+    client: &Client,
+    url:    &str,
+    depth:  u32,
+    keyword: &str
+) -> Vec<String> {
+    let visited = Arc::new(Mutex::new(Vec::new()));
+    crawl(client, url, depth, visited.clone()).await;
+
+    let mut results = Vec::new();
+    let urls = visited.lock().unwrap().clone();
+
+    for url in urls.iter() {
+        let html = match fetch_page(client, url).await {
+            Ok(html) => html,
+            Err(_) => continue,
+        };
+        let text = extract_text(&html);
+        if text.contains(keyword) {
+            results.push(url.clone());
+        }
+    }
+    results
+}
+
 pub fn extract_text(html: &str) -> String {
     let document = Html::parse_document(html); // parse the raw HTML
     let selector = Selector::parse("body").unwrap(); // build a CSS selector targeting <body>
@@ -70,11 +99,11 @@ pub fn extract_text(html: &str) -> String {
     document
         .select(&selector)
         .next()                 // get the first match as Option<ElementRef>
-       .map(|x| x              // if body exists, extract its text
+        .map(|x| x              // if body exists, extract its text
             .text()             // iterator over all text nodes inside body
             .collect::<Vec<_>>()  // gather text nodes into a Vec
             .join(" ")          // join them into one String with spaces
-        )
+            )
         .unwrap_or_default()    // if no body found, return empty String
 }
 
