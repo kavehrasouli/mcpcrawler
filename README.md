@@ -9,6 +9,8 @@ A web crawler built in Rust, exposed as Model Context Protocl (MCP) server.
 
 - `fetch_content_in_md` - fetches the text content of a single URL in markdown format (.md)
 
+- `search_site_keyword` — crawls a website and returns only URLs containing a specific keyword
+
 ## Planned
 - [ ] JavaScript rendering support via headless browser
 
