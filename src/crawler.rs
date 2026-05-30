@@ -5,6 +5,17 @@ use std::pin::Pin;
 use futures::future::join_all;
 use std::sync::{Arc, Mutex};
 
+const BLOCKED_DOMAINS: &[&str] = &[
+    "google-analytics.com",
+    "doubleclick.net",
+    "amazon-adsystem.com",
+    "googlesyndication.com",
+    "googletagmanager.com",
+    "ads.yahoo.com",
+    "scorecardresearch.com",
+    "outbrain.com",
+];
+
 
 pub fn normalize_url(url: &str) -> String {
     if url.starts_with("http://") || url.starts_with("https://"){
@@ -12,6 +23,14 @@ pub fn normalize_url(url: &str) -> String {
     } else {
         format!("https://{}", url)
     }
+}
+
+fn is_blocked(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| normalize_domain(h).to_string()))
+        .map(|d| BLOCKED_DOMAINS.iter().any(|blocked| d.contains(blocked)))
+        .unwrap_or(false)
 }
 
 pub fn normalize_domain(domain: &str) -> &str {
@@ -74,6 +93,7 @@ pub fn crawl<'a>(
         let futures: Vec<_> = links
             .iter()
             .filter(|link| !visited.lock().unwrap().contains(*link))
+            .filter(|link| !is_blocked(link))
             .map(|link| crawl(client, link, depth-1, visited.clone()))
             .collect();
         join_all(futures).await;
@@ -105,7 +125,7 @@ pub async fn search_site(
     results
 }
 
-pub fn crawl_same_domain_inner<'a>(
+fn crawl_same_domain_inner<'a>(
     client: &'a Client,
     url: &'a str,
     depth: u32,
@@ -136,7 +156,8 @@ pub fn crawl_same_domain_inner<'a>(
                 .and_then(|u| u.host_str().map(|h| normalize_domain(h).to_string()))
                 .map(|d| d == base_domain)
                 .unwrap_or(false)
-        )
+            )
+            .filter(|link| !is_blocked(link))
         .map(|link| crawl_same_domain_inner(client, link, depth-1, visited.clone(), base_domain))
         .collect();
 
@@ -175,3 +196,4 @@ pub fn extract_text(html: &str) -> String {
 pub fn extract_text_md(html: &str) -> String {
     htmd::convert(html).unwrap_or_default()
 }
+
