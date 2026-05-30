@@ -5,6 +5,8 @@ A web crawler built in Rust, exposed as Model Context Protocl (MCP) server.
 ## Tools
 - `crawl_site` — crawls a URL up to a given depth and returns all visited URLs.
 
+- `crawl_site_same_domain` — crawls a URL but only follows links on the same domain
+
 - `fetch_content` — fetches the text content of a single URL
 
 - `fetch_content_in_md` - fetches the text content of a single URL in markdown format (.md)
