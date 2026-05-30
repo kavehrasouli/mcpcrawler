@@ -5,6 +5,19 @@ use std::pin::Pin;
 use futures::future::join_all;
 use std::sync::{Arc, Mutex};
 
+
+pub fn normalize_url(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://"){
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    }
+}
+
+pub fn normalize_domain(domain: &str) -> &str {
+    domain.strip_prefix("www.").unwrap_or(domain)
+}
+
 // fetch_page:
 // takes a URL, makes a HTTP GET request to it,
 // and returns the raw HTML as a String.
@@ -90,6 +103,58 @@ pub async fn search_site(
         }
     }
     results
+}
+
+pub fn crawl_same_domain_inner<'a>(
+    client: &'a Client,
+    url: &'a str,
+    depth: u32,
+    visited: Arc<Mutex<Vec<String>>>,
+    base_domain: &'a str
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    let visited = Arc::clone(&visited);
+    Box::pin(async move {
+        if depth == 0 {return;}
+        {
+            let mut guard = visited.lock().unwrap();
+            if guard.contains(&url.to_string()) {return;}
+            guard.push(url.to_string());
+        }
+
+        let html = match fetch_page(client, url).await {
+            Ok(html) => html,
+            Err(_) => return,
+        };
+
+        let links = extract_links(&html, url);
+
+        let futures: Vec<_> = links
+            .iter()
+            .filter(|link| !visited.lock().unwrap().contains(*link))
+            .filter(|link| Url::parse(link)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| normalize_domain(h).to_string()))
+                .map(|d| d == base_domain)
+                .unwrap_or(false)
+        )
+        .map(|link| crawl_same_domain_inner(client, link, depth-1, visited.clone(), base_domain))
+        .collect();
+
+    join_all(futures).await;
+    })
+}
+
+pub async fn crawl_same_domain(
+    client: &Client,
+    url: &str,
+    depth: u32
+) -> Vec<String> {
+    let url = normalize_url(url);
+    let base = Url::parse(&url).unwrap();
+    let domain = normalize_domain(base.host_str().unwrap_or("")).to_string();
+    let visited = Arc::new(Mutex::new(Vec::new()));
+    crawl_same_domain_inner(client, &url, depth, visited.clone(), &domain).await;
+    visited.lock().unwrap().clone()
 }
 
 pub fn extract_text(html: &str) -> String {
