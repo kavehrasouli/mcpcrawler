@@ -44,10 +44,10 @@ pub fn normalize_domain(domain: &str) -> &str {
 pub async fn fetch_page(client: &Client, url: &str) -> Result<String, reqwest::Error> 
 {
     let body = client
-        .get(url)   // prepare - build the request
-        .send()     // send the request
+        .get(url)
+        .send()
         .await?
-        .text()     // read the body as a string
+        .text()
         .await?;
 
     Ok(body)
@@ -209,4 +209,3 @@ pub fn extract_text(html: &str) -> String {
 pub fn extract_text_md(html: &str) -> String {
     htmd::convert(html).unwrap_or_default()
 }
-
