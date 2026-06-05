@@ -4,6 +4,9 @@ use url::Url;
 use std::pin::Pin;
 use futures::future::join_all;
 use std::sync::{Arc, Mutex};
+use futures::StreamExt;
+use chromiumoxide::{Browser, BrowserConfig};
+
 
 const BLOCKED_DOMAINS: &[&str] = &[
     "google-analytics.com",
@@ -50,6 +53,20 @@ pub async fn fetch_page(client: &Client, url: &str) -> Result<String, reqwest::E
         .await?;
 
     Ok(body)
+}
+
+pub async fn fetch_page_headless(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let (browser, mut handler) = 
+        Browser::launch(BrowserConfig::builder().build()?).await?;
+    
+    let handle = tokio::spawn(async move {
+        while let Some(_) = handler.next().await {}
+    });
+
+    let page = browser.new_page(url).await?;
+    let html = page.wait_for_navigation().await?.content().await?;
+    handle.abort();
+    Ok(html)
 }
 
 // extract_links: 
