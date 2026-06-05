@@ -10,7 +10,6 @@ pub struct CrawlInput {
     pub url: String,
     #[schemars(description = "How deep to follow links")]
     pub depth: u32,
-
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -27,6 +26,7 @@ pub struct SearchInput {
 pub struct FetchInput {
     #[schemars(description = "The URL to fetch content from")]
     pub url: String,
+    pub headless: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,18 +61,34 @@ impl Crawler {
 
     #[tool(description = "Fetch the content of a URL")]
     async fn fetch_content(&self, #[tool(aggr)] input: FetchInput) -> String {
-        match fetch_page(&self.client, &input.url).await {
-            Ok(html) => extract_text(&html),
-            Err(_)   => "Failed to fetch page".to_string(),
-        }
+        let html = if input.headless {
+            match fetch_page_headless(&input.url).await {
+                Ok(html) => html,
+                Err(_)   => return "Failed to fetch page".to_string(),
+            }
+        } else {
+            match fetch_page(&self.client, &input.url).await {
+                Ok(html) => html,
+                Err(_)   => return "Failed to fetch page".to_string(),
+            }
+        };
+        extract_text(&html)
     }
 
     #[tool(description = "Fetch the content of a URL in .md format")]
     async fn fetch_content_in_md(&self, #[tool(aggr)] input: FetchInput) -> String {
-        match fetch_page(&self.client, &input.url).await {
-            Ok(html) => extract_text_md(&html),
-            Err(_)   => "Failed to fetch page in markdown (.md)".to_string(),
-        }
+        let html = if input.headless {
+            match fetch_page_headless(&input.url).await {
+                Ok(html) => html,
+                Err(_)   => return "Failed to fetch page in markdown in headless".to_string(),
+            }
+        } else {
+            match fetch_page(&self.client, &input.url).await {
+                Ok(html) => html,
+                Err(_)   => return "Failed to fetch page in markdown".to_string(),
+            }
+        };
+        extract_text_md(&html)
     }
 
     #[tool(description = "Crawl a website and return visited URLs containing a specific keyword")]
@@ -84,11 +100,18 @@ impl Crawler {
 
     #[tool(description = "Extract all links from a URL")]
     async fn extract_all_links(&self, #[tool(aggr)] input: FetchInput) -> String {
-        match fetch_page(&self.client, &input.url).await {
-            Ok(html) => extract_links(&html, &input.url).join("\n"),
-            Err(_)   => "Failed to extract links".to_string(),
-        }
-    }
+        let html = if input.headless {
+            match fetch_page_headless(&input.url).await {
+                Ok(html) => html,
+                Err(_)   => return "Failed to extract links in headless".to_string(),
+            }
+        } else {
+            match fetch_page(&self.client, &input.url).await {
+                Ok(html) => html,
+                Err(_)   => return "Failed to extract links".to_string(),
+            }
+        };
+        extract_links(&html, &input.url).join("\n")
 }
 
 #[tool(tool_box)]
