@@ -1,7 +1,7 @@
 use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
-use crate::crawler::{crawl, fetch_page, extract_text, extract_text_md, search_site, crawl_same_domain};
+use crate::crawler::{crawl, fetch_page, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -80,6 +80,14 @@ impl Crawler {
         search_site(&self.client, &input.url, input.depth, &input.keyword)
             .await
             .join("\n")
+    }
+
+    #[tool(description = "Extract all links from a URL")]
+    async fn extract_all_links(&self, #[tool(aggr)] input: FetchInput) -> String {
+        match fetch_page(&self.client, &input.url).await {
+            Ok(html) => extract_links(&html, &input.url).join("\n"),
+            Err(_)   => "Failed to extract links".to_string(),
+        }
     }
 }
 
