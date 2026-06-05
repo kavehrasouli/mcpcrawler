@@ -1,7 +1,7 @@
 use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
-use crate::crawler::{crawl, fetch_page, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain};
+use crate::crawler::{crawl, fetch_page, fetch_page_headless, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -44,6 +44,7 @@ impl Crawler {
                 .unwrap()
         }
     }
+
 
     #[tool(description = "Crawl a website and return all visited URLs")]
     async fn crawl_site(&self, #[tool(aggr)] input: CrawlInput) -> String {
@@ -112,6 +113,7 @@ impl Crawler {
             }
         };
         extract_links(&html, &input.url).join("\n")
+    }
 }
 
 #[tool(tool_box)]
