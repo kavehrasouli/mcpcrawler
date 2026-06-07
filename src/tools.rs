@@ -1,7 +1,7 @@
 use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
-use crate::crawler::{crawl, fetch_page, fetch_page_headless, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain};
+use crate::crawler::{crawl, fetch_page, fetch_page_headless, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain, extract_metadata};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -113,6 +113,14 @@ impl Crawler {
             }
         };
         extract_links(&html, &input.url).join("\n")
+    }
+
+    #[tool(description = "Extract metadata from a URL")]
+    async fn extract_meta(&self, #[tool(aggr)] input: FetchInput) -> String {
+        match fetch_page(&self.client, &input.url).await {
+            Ok(html) => extract_metadata(&html),
+            Err(_)   => "Failed to fetch page".to_string(),
+        }
     }
 }
 
