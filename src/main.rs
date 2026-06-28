@@ -13,5 +13,5 @@ mod tests;
 async fn main() {
     let service = Crawler::new();
     let transport = (stdin(), stdout());
-    service.serve(transport).await.unwrap();
+    service.serve(transport).await.unwrap().waiting().await.unwrap();
 }

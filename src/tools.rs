@@ -1,4 +1,4 @@
-use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
+use rmcp::{ServerHandler, model::{ServerCapabilities, ServerInfo}, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
 use crate::crawler::{crawl, fetch_page, fetch_page_headless, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain, extract_metadata, login_and_fetch};
@@ -73,12 +73,12 @@ impl Crawler {
         let html = if input.headless {
             match fetch_page_headless(&input.url).await {
                 Ok(html) => html,
-                Err(_)   => return "Failed to fetch page".to_string(),
+                Err(e)   => return format!("Failed to fetch page headless: {e:?}"),
             }
         } else {
             match fetch_page(&self.client, &input.url).await {
                 Ok(html) => html,
-                Err(_)   => return "Failed to fetch page".to_string(),
+                Err(e)   => return format!("Failed to fetch page: {e:?}"),
             }
         };
         extract_text(&html)
@@ -155,6 +155,7 @@ impl ServerHandler for Crawler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some("A web crawler".into()),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
     }

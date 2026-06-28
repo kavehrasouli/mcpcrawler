@@ -39,10 +39,11 @@ pub fn normalize_domain(domain: &str) -> &str {
     domain.strip_prefix("www.").unwrap_or(domain)
 }
 
-pub async fn fetch_page(client: &Client, url: &str) -> Result<String, reqwest::Error> 
+pub async fn fetch_page(client: &Client, url: &str) -> Result<String, reqwest::Error>
 {
+    let url = normalize_url(url);
     let body = client
-        .get(url)
+        .get(&url)
         .send()
         .await?
         .text()
@@ -52,14 +53,15 @@ pub async fn fetch_page(client: &Client, url: &str) -> Result<String, reqwest::E
 }
 
 pub async fn fetch_page_headless(url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let (browser, mut handler) = 
+    let url = normalize_url(url);
+    let (browser, mut handler) =
         Browser::launch(BrowserConfig::builder().build()?).await?;
-    
+
     let handle = tokio::spawn(async move {
         while let Some(_) = handler.next().await {}
     });
 
-    let page = browser.new_page(url).await?;
+    let page = browser.new_page(&url).await?;
     let html = page.wait_for_navigation().await?.content().await?;
     handle.abort();
     Ok(html)
@@ -150,11 +152,12 @@ pub async fn login_and_fetch(
     Ok(html)
 }
 
-pub fn extract_links(html: &str, base_url: &str) -> Vec<String> 
+pub fn extract_links(html: &str, base_url: &str) -> Vec<String>
 {
+    let base_url = normalize_url(base_url);
     let document = Html::parse_document(html);
     let selector = Selector::parse("a[href]").unwrap();
-    let base     = Url::parse(base_url).unwrap();
+    let base     = Url::parse(&base_url).unwrap();
     document
         .select(&selector)
         .filter_map(|x| x.value().attr("href"))
