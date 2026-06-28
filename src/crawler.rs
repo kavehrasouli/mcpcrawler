@@ -5,7 +5,7 @@ use std::pin::Pin;
 use futures::future::join_all;
 use std::sync::{Arc, Mutex};
 use futures::StreamExt;
-use chromiumoxide::{Browser, BrowserConfig};
+use chromiumoxide::{Browser, BrowserConfig, page::Page};
 
 
 const BLOCKED_DOMAINS: &[&str] = &[
@@ -61,6 +61,91 @@ pub async fn fetch_page_headless(url: &str) -> Result<String, Box<dyn std::error
 
     let page = browser.new_page(url).await?;
     let html = page.wait_for_navigation().await?.content().await?;
+    handle.abort();
+    Ok(html)
+}
+
+
+const USERNAME_SELECTORS: &[&str] = &[
+    "input[type='email']",
+    "input[autocomplete='username']",
+    "input[autocomplete='email']",
+    "input[name*='user']",
+    "input[name*='email']",
+    "input[id*='user']",
+    "input[id*='email']",
+    "input[name='loginfmt']",
+    "input[name='login']",
+    "input[type='text']",
+];
+
+const PASSWORD_SELECTORS: &[&str] = &[
+    "input[type='password']",
+    "input[name*='pass']",
+    "input[id*='pass']",
+];
+
+const SUBMIT_SELECTORS: &[&str] = &[
+    "button[type='submit']",
+    "input[type='submit']",
+    "button[id*='login']",
+    "button[id*='signin']",
+    "button[class*='login']",
+    "button[class*='signin']",
+    "[data-testid*='login']",
+    "[data-testid*='signin']",
+];
+
+async fn find_element_any(page: &Page, selectors: &[&str])
+    -> Option<chromiumoxide::element::Element>
+{
+    for selector in selectors {
+        if let Ok(el) = page.find_element(*selector).await {
+            return Some(el);
+        }
+    }
+    None
+}
+
+pub async fn login_and_fetch(
+    login_url: &str,
+    url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, Box<dyn std::error::Error>>
+{
+    let (browser, mut handler) =
+        Browser::launch(BrowserConfig::builder().build()?).await?;
+
+    let handle = tokio::spawn(async move {
+        while let Some(_) = handler.next().await {}
+    });
+
+    let page = browser.new_page(login_url).await?;
+    page.wait_for_navigation().await?;
+
+    find_element_any(&page, USERNAME_SELECTORS)
+        .await
+        .ok_or("username field not found")?
+        .click().await?
+        .type_str(username).await?;
+
+    find_element_any(&page, PASSWORD_SELECTORS)
+        .await
+        .ok_or("password field not found")?
+        .click().await?
+        .type_str(password).await?;
+
+    find_element_any(&page, SUBMIT_SELECTORS)
+        .await
+        .ok_or("submit button not found")?
+        .click().await?;
+
+    page.wait_for_navigation().await?;
+
+    let page = browser.new_page(url).await?;
+    let html = page.wait_for_navigation().await?.content().await?;
+
     handle.abort();
     Ok(html)
 }

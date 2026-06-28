@@ -1,5 +1,6 @@
 mod crawler;
 mod tools;
+mod passmanager;
 
 use tools::Crawler;
 use rmcp::ServiceExt;

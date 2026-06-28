@@ -1,7 +1,7 @@
 use rmcp::{ServerHandler, model::ServerInfo, schemars, tool};
 use serde::Deserialize;
 use reqwest::Client;
-use crate::crawler::{crawl, fetch_page, fetch_page_headless, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain, extract_metadata};
+use crate::crawler::{crawl, fetch_page, fetch_page_headless, extract_links, extract_text, extract_text_md, search_site, crawl_same_domain, extract_metadata, login_and_fetch};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -27,6 +27,14 @@ pub struct FetchInput {
     #[schemars(description = "The URL to fetch content from")]
     pub url: String,
     pub headless: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoginInput {
+    #[schemars(description = "The URL to login to")]
+    pub url: String,
+    #[schemars(description = "Master password to decrypy stored credentials")]
+    pub master_password: String
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +128,24 @@ impl Crawler {
         match fetch_page(&self.client, &input.url).await {
             Ok(html) => extract_metadata(&html),
             Err(_)   => "Failed to fetch page".to_string(),
+        }
+    }
+
+    #[tool(description = "Login to a website using credentials stored in passmanager")]
+    async fn login_to_site(&self, #[tool(aggr)] input: LoginInput) -> String {
+        match crate::passmanager::get_credential(&input.url, &input.master_password).await {
+            Some((username, password)) => {
+                match login_and_fetch(
+                    &input.url,
+                    &input.url,
+                    &username,
+                    &password,
+                ).await {
+                    Ok(html) => extract_text(&html),
+                    Err(e)   => format!("Login failed: {}", e),
+                }
+            }
+            None => format!("No credentials found for {}", input.url),
         }
     }
 }
