@@ -111,11 +111,11 @@ async fn find_element_any(page: &Page, selectors: &[&str])
 
 pub async fn login_and_fetch(
     login_url: &str,
-    url: &str,
     username: &str,
     password: &str,
 ) -> Result<String, Box<dyn std::error::Error>>
 {
+    let login_url = normalize_url(login_url);
     let (browser, mut handler) =
         Browser::launch(BrowserConfig::builder().build()?).await?;
 
@@ -123,8 +123,8 @@ pub async fn login_and_fetch(
         while let Some(_) = handler.next().await {}
     });
 
-    let page = browser.new_page(login_url).await?;
-    page.wait_for_navigation().await?;
+    let page = browser.new_page(&login_url).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     find_element_any(&page, USERNAME_SELECTORS)
         .await
@@ -143,10 +143,8 @@ pub async fn login_and_fetch(
         .ok_or("submit button not found")?
         .click().await?;
 
-    page.wait_for_navigation().await?;
-
-    let page = browser.new_page(url).await?;
-    let html = page.wait_for_navigation().await?.content().await?;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let html = page.content().await?;
 
     handle.abort();
     Ok(html)

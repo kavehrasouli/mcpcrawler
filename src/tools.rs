@@ -137,7 +137,6 @@ impl Crawler {
             Some((username, password)) => {
                 match login_and_fetch(
                     &input.url,
-                    &input.url,
                     &username,
                     &password,
                 ).await {
