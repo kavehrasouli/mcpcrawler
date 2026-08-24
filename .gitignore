@@ -2,3 +2,4 @@
 .env
 /src/tests.rs
 plans.txt
+todo.md
