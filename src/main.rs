@@ -19,10 +19,38 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    if let Err(e) = service.waiting().await {
-        eprintln!("mcpcrawler: server stopped: {e}");
-        return std::process::ExitCode::FAILURE;
-    }
+    // Whichever arrives first, the headless browser still gets torn down. Without
+    // this Chrome is orphaned and its profile lock blocks the next launch. SIGTERM
+    // matters as much as SIGINT: that is how most supervisors stop a stdio server.
+    let outcome = tokio::select! {
+        result = service.waiting() => result.err().map(|e| e.to_string()),
+        _ = tokio::signal::ctrl_c() => None,
+        _ = terminated() => None,
+    };
 
-    std::process::ExitCode::SUCCESS
+    crawler::shutdown_browser().await;
+
+    match outcome {
+        Some(e) => {
+            eprintln!("mcpcrawler: server stopped: {e}");
+            std::process::ExitCode::FAILURE
+        }
+        None => std::process::ExitCode::SUCCESS,
+    }
+}
+
+#[cfg(unix)]
+async fn terminated() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminated() {
+    std::future::pending().await
 }

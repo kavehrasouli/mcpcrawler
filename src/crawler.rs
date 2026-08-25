@@ -54,7 +54,6 @@ pub enum CrawlError {
     Status(u16),
     ContentType(String),
     TooLarge(usize),
-    RobotsDenied,
     Browser(String),
 }
 
@@ -67,7 +66,6 @@ impl fmt::Display for CrawlError {
             CrawlError::Status(c) => write!(f, "server returned HTTP {c}"),
             CrawlError::ContentType(c) => write!(f, "not an HTML page (Content-Type: {c})"),
             CrawlError::TooLarge(n) => write!(f, "page exceeds the {n} byte limit"),
-            CrawlError::RobotsDenied => write!(f, "disallowed by robots.txt"),
             CrawlError::Browser(e) => write!(f, "headless browser failed: {e}"),
         }
     }
@@ -257,19 +255,25 @@ pub async fn fetch_page(
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Convenience wrapper for callers holding a raw string.
-pub async fn fetch_page_str(client: &Client, url: &str) -> Result<String, CrawlError> {
-    let url = canonicalize(url)?;
-    fetch_page(client, &url, CrawlConfig::default().max_body_bytes).await
-}
-
 // headless browser
-static BROWSER: tokio::sync::OnceCell<Arc<Browser>> = tokio::sync::OnceCell::const_new();
+static BROWSER: tokio::sync::OnceCell<Arc<tokio::sync::Mutex<Browser>>> =
+    tokio::sync::OnceCell::const_new();
 
-async fn shared_browser() -> Result<Arc<Browser>, CrawlError> {
+static PROFILE_DIR: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
+    // A private profile per process. chromiumoxide otherwise reuses one shared
+    // directory, so a SingletonLock left behind by a crashed run blocks every
+    // later launch on the machine.
+    std::env::temp_dir().join(format!("mcpcrawler-{}", std::process::id()))
+});
+
+/// Launch the browser once and reuse it, opening a tab per fetch. Previously
+/// every headless call spawned a fresh Chrome and never closed it.
+async fn shared_browser() -> Result<Arc<tokio::sync::Mutex<Browser>>, CrawlError> {
     BROWSER
         .get_or_try_init(|| async {
+            sweep_stale_profiles();
             let config = BrowserConfig::builder()
+                .user_data_dir(PROFILE_DIR.as_path())
                 .build()
                 .map_err(CrawlError::Browser)?;
             let (browser, mut handler) = Browser::launch(config)
@@ -279,31 +283,106 @@ async fn shared_browser() -> Result<Arc<Browser>, CrawlError> {
             // The handler drives the CDP connection for the process lifetime.
             tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-            Ok(Arc::new(browser))
+            Ok(Arc::new(tokio::sync::Mutex::new(browser)))
         })
         .await
         .map(Arc::clone)
 }
 
+/// Delete profile directories left behind by runs that were hard-killed before
+/// they could clean up. Per-process profiles would otherwise accumulate.
+fn sweep_stale_profiles() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let day = Duration::from_secs(24 * 60 * 60);
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ours = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("mcpcrawler-"));
+
+        if !is_ours || path == *PROFILE_DIR {
+            continue;
+        }
+        // Age, not liveness: a browser still in use rewrites its profile constantly.
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() > day)
+            .unwrap_or(false);
+
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Close the browser and remove its profile directory. Must run before the
+/// process exits, or Chrome is orphaned and the profile is left behind.
+pub async fn shutdown_browser() {
+    if let Some(browser) = BROWSER.get() {
+        let mut browser = browser.lock().await;
+        let _ = browser.close().await;
+        let _ = browser.wait().await;
+    }
+    let _ = std::fs::remove_dir_all(PROFILE_DIR.as_path());
+}
+
+/// How long to let a client-rendered page settle before reading its DOM.
+pub const DEFAULT_SETTLE: Duration = Duration::from_secs(6);
+
+/// Open a tab and let client-rendered pages finish rendering.
+///
+/// `wait_for_navigation` returns as soon as the document loads, which for a
+/// single-page app is before the framework has drawn anything. This polls until
+/// the DOM stops growing, so a React or Next.js site yields real content rather
+/// than an empty shell.
+async fn open_settled_page(
+    browser: &tokio::sync::Mutex<Browser>,
+    url: &str,
+    settle: Duration,
+) -> Result<chromiumoxide::page::Page, CrawlError> {
+    let page = {
+        let browser = browser.lock().await;
+        browser
+            .new_page(url)
+            .await
+            .map_err(|e| CrawlError::Browser(e.to_string()))?
+    };
+
+    if let Err(e) = page.wait_for_navigation().await {
+        let _ = page.close().await;
+        return Err(CrawlError::Browser(e.to_string()));
+    }
+
+    let deadline = Instant::now() + settle;
+    let mut previous = 0usize;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let Ok(html) = page.content().await else { break };
+        // Two consecutive polls at the same size means rendering has stopped.
+        if html.len() == previous && previous > 0 {
+            break;
+        }
+        previous = html.len();
+    }
+
+    Ok(page)
+}
+
 pub async fn fetch_page_headless(url: &str) -> Result<String, CrawlError> {
     let url = canonicalize(url)?;
     let browser = shared_browser().await?;
+    let page = open_settled_page(&browser, url.as_str(), DEFAULT_SETTLE).await?;
 
-    let page = browser
-        .new_page(url.as_str())
+    // Read separately so the tab is closed on every path, not just success.
+    let result = page
+        .content()
         .await
-        .map_err(|e| CrawlError::Browser(e.to_string()))?;
-
-    // Run the body separately so the tab is closed on every path, not just success.
-    let result = async {
-        page.wait_for_navigation()
-            .await
-            .map_err(|e| CrawlError::Browser(e.to_string()))?;
-        page.content()
-            .await
-            .map_err(|e| CrawlError::Browser(e.to_string()))
-    }
-    .await;
+        .map_err(|e| CrawlError::Browser(e.to_string()));
 
     let _ = page.close().await;
     result
@@ -359,14 +438,9 @@ pub async fn login_and_fetch(
     let login_url = canonicalize(login_url)?;
     let browser = shared_browser().await?;
 
-    let page = browser
-        .new_page(login_url.as_str())
-        .await
-        .map_err(|e| CrawlError::Browser(e.to_string()))?;
+    let page = open_settled_page(&browser, login_url.as_str(), DEFAULT_SETTLE).await?;
 
     let result = async {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
         find_element_any(&page, USERNAME_SELECTORS)
             .await
             .ok_or_else(|| CrawlError::Browser("username field not found".into()))?
