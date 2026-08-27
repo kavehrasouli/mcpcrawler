@@ -27,13 +27,46 @@ impl Fixture {
     }
 }
 
-fn body_for(path: &str) -> (u16, &'static str, String) {
+fn body_for(path: &str) -> (u16, &'static str, Vec<u8>) {
     match path {
         "/robots.txt" => (
             200,
             "text/plain",
-            "User-agent: *\nDisallow: /secret\n".to_string(),
+            "User-agent: *\nDisallow: /secret\nSitemap: /sitemap.xml\n".into(),
         ),
+        "/sitemap.xml" => (
+            200,
+            "application/xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+               <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                 <sitemap><loc>/sm-plain.xml</loc><lastmod>2026-08-20</lastmod></sitemap>
+                 <sitemap><loc>/sm-gzipped.xml.gz</loc></sitemap>
+               </sitemapindex>"#
+                .into(),
+        ),
+        "/sm-plain.xml" => (
+            200,
+            "application/xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+               <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                 <url><loc>/alpha</loc><lastmod>2026-08-21</lastmod></url>
+                 <url><loc>/nav-noise</loc></url>
+                 <url><loc>/d1?utm_source=sitemap</loc></url>
+               </urlset>"#
+                .into(),
+        ),
+        "/sm-gzipped.xml.gz" => {
+            use std::io::Write;
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+               <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                 <url><loc>/d2</loc></url>
+                 <url><loc>/d3</loc></url>
+               </urlset>"#;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(xml.as_bytes()).unwrap();
+            (200, "application/gzip", encoder.finish().unwrap())
+        }
         "/" => (
             200,
             "text/html",
@@ -56,7 +89,7 @@ fn body_for(path: &str) -> (u16, &'static str, String) {
                  </main>
                  <footer>footer clutter</footer>
                </body></html>"#
-                .to_string(),
+                .into(),
         ),
         "/alpha" => (
             200,
@@ -65,16 +98,16 @@ fn body_for(path: &str) -> (u16, &'static str, String) {
                <p>The Needle appears here in the alpha page.</p>
                <script>var junk = "needle in script";</script>
                </main></body></html>"#
-                .to_string(),
+                .into(),
         ),
-        "/nav-noise" => (200, "text/html", "<html><body><main>noise</main></body></html>".to_string()),
+        "/nav-noise" => (200, "text/html", "<html><body><main>noise</main></body></html>".into()),
         // A chain, so the depth guard rail has something to actually stop.
-        "/d1" => (200, "text/html", r#"<html><body><main>one <a href="/d2">two</a></main></body></html>"#.to_string()),
-        "/d2" => (200, "text/html", r#"<html><body><main>two <a href="/d3">three</a></main></body></html>"#.to_string()),
-        "/d3" => (200, "text/html", "<html><body><main>three</main></body></html>".to_string()),
-        "/secret" => (200, "text/html", "<html><body><main>classified</main></body></html>".to_string()),
-        "/report.pdf" => (200, "application/pdf", "%PDF-1.4 not html".to_string()),
-        _ => (404, "text/html", "<html><body>not found</body></html>".to_string()),
+        "/d1" => (200, "text/html", r#"<html><body><main>one <a href="/d2">two</a></main></body></html>"#.into()),
+        "/d2" => (200, "text/html", r#"<html><body><main>two <a href="/d3">three</a></main></body></html>"#.into()),
+        "/d3" => (200, "text/html", "<html><body><main>three</main></body></html>".into()),
+        "/secret" => (200, "text/html", "<html><body><main>classified</main></body></html>".into()),
+        "/report.pdf" => (200, "application/pdf", "%PDF-1.4 not html".into()),
+        _ => (404, "text/html", "<html><body>not found</body></html>".into()),
     }
 }
 
@@ -104,12 +137,13 @@ async fn fixture() -> Fixture {
                 *counter.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
 
                 let (status, content_type, body) = body_for(&path);
-                let response = format!(
+                let header = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
                 let _ = socket.shutdown().await;
             });
         }
@@ -387,4 +421,129 @@ async fn search_ignores_text_inside_scripts() {
         .await
         .unwrap();
     assert_eq!(matches[0].hits, 1);
+}
+
+// ---------------------------------------------------------------------------
+// sitemaps
+//
+// The entry point that makes client-rendered sites reachable at all: their HTML
+// carries no links, but their sitemap lists every page.
+// ---------------------------------------------------------------------------
+
+use crate::sitemap::{self, SitemapConfig};
+
+fn sitemap_config() -> SitemapConfig {
+    SitemapConfig {
+        per_host_delay: Duration::ZERO,
+        ..SitemapConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn discovers_the_sitemap_named_in_robots_txt() {
+    let server = fixture().await;
+    let found = sitemap::discover(&test_client(), &server.url("/")).await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found[0].as_str().ends_with("/sitemap.xml"));
+}
+
+#[tokio::test]
+async fn walks_an_index_into_its_child_sitemaps() {
+    let server = fixture().await;
+    let outcome = sitemap::collect(&test_client(), &server.url("/"), &sitemap_config())
+        .await
+        .unwrap();
+
+    // One index plus both children.
+    assert_eq!(outcome.sitemaps_read, 3);
+    let urls = outcome.urls();
+    assert!(urls.iter().any(|u| u.ends_with("/alpha")));
+    assert!(urls.iter().any(|u| u.ends_with("/nav-noise")));
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+}
+
+#[tokio::test]
+async fn reads_gzipped_child_sitemaps() {
+    let server = fixture().await;
+    let outcome = sitemap::collect(&test_client(), &server.url("/"), &sitemap_config())
+        .await
+        .unwrap();
+    let urls = outcome.urls();
+    // /d2 and /d3 exist only inside the gzipped child.
+    assert!(urls.iter().any(|u| u.ends_with("/d2")), "gunzip failed: {urls:?}");
+    assert!(urls.iter().any(|u| u.ends_with("/d3")));
+}
+
+#[tokio::test]
+async fn sitemap_urls_are_canonicalized() {
+    let server = fixture().await;
+    let outcome = sitemap::collect(&test_client(), &server.url("/"), &sitemap_config())
+        .await
+        .unwrap();
+    // The sitemap lists /d1?utm_source=sitemap; the tracking param is stripped.
+    assert!(outcome.urls().iter().any(|u| u.ends_with("/d1")));
+    assert!(!outcome.urls().iter().any(|u| u.contains("utm_source")));
+}
+
+#[tokio::test]
+async fn sitemap_captures_lastmod() {
+    let server = fixture().await;
+    let outcome = sitemap::collect(&test_client(), &server.url("/"), &sitemap_config())
+        .await
+        .unwrap();
+    let alpha = outcome
+        .entries
+        .iter()
+        .find(|e| e.url.path() == "/alpha")
+        .expect("/alpha missing");
+    assert_eq!(alpha.lastmod.as_deref(), Some("2026-08-21"));
+}
+
+#[tokio::test]
+async fn sitemap_filter_applies_while_walking() {
+    let server = fixture().await;
+    let cfg = SitemapConfig { contains: Some("d".into()), ..sitemap_config() };
+    let outcome = sitemap::collect(&test_client(), &server.url("/"), &cfg).await.unwrap();
+
+    let urls = outcome.urls();
+    assert!(urls.iter().all(|u| u.contains("/d")), "unfiltered: {urls:?}");
+    assert!(!urls.iter().any(|u| u.ends_with("/alpha")));
+}
+
+#[tokio::test]
+async fn sitemap_respects_the_url_budget() {
+    let server = fixture().await;
+    let cfg = SitemapConfig { max_urls: 2, ..sitemap_config() };
+    let outcome = sitemap::collect(&test_client(), &server.url("/"), &cfg).await.unwrap();
+    assert_eq!(outcome.entries.len(), 2);
+    assert!(outcome.truncated);
+}
+
+#[tokio::test]
+async fn sitemap_accepts_a_direct_sitemap_url() {
+    let server = fixture().await;
+    let outcome = sitemap::collect(&test_client(), &server.url("/sm-plain.xml"), &sitemap_config())
+        .await
+        .unwrap();
+    assert_eq!(outcome.sitemaps_read, 1);
+    assert_eq!(outcome.entries.len(), 3);
+}
+
+#[tokio::test]
+async fn crawl_can_seed_itself_from_the_sitemap() {
+    let server = fixture().await;
+
+    // Depth 0 means no link following at all, so every page fetched beyond the
+    // seed must have come from the sitemap.
+    let cfg = CrawlConfig { max_depth: 0, seed_from_sitemap: true, ..test_config() };
+    let outcome = crawl(&test_client(), &server.url("/"), &cfg).await.unwrap();
+
+    let urls = outcome.urls();
+    assert!(urls.iter().any(|u| u.ends_with("/alpha")), "got {urls:?}");
+    assert!(urls.iter().any(|u| u.ends_with("/d2")));
+
+    // Without seeding, the same crawl reaches only the seed.
+    let cfg = CrawlConfig { max_depth: 0, ..test_config() };
+    let plain = crawl(&test_client(), &server.url("/"), &cfg).await.unwrap();
+    assert_eq!(plain.pages.len(), 1);
 }

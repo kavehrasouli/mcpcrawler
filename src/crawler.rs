@@ -55,6 +55,7 @@ pub enum CrawlError {
     ContentType(String),
     TooLarge(usize),
     Browser(String),
+    Parse(String),
 }
 
 impl fmt::Display for CrawlError {
@@ -67,6 +68,7 @@ impl fmt::Display for CrawlError {
             CrawlError::ContentType(c) => write!(f, "not an HTML page (Content-Type: {c})"),
             CrawlError::TooLarge(n) => write!(f, "page exceeds the {n} byte limit"),
             CrawlError::Browser(e) => write!(f, "headless browser failed: {e}"),
+            CrawlError::Parse(e) => write!(f, "could not parse XML: {e}"),
         }
     }
 }
@@ -95,6 +97,10 @@ pub struct CrawlConfig {
     /// Only follow links whose host matches the seed's.
     pub same_domain_only: bool,
     pub max_body_bytes: usize,
+    /// Seed the frontier from the site's sitemap instead of relying on links
+    /// found in the seed page. Necessary for client-rendered sites, whose HTML
+    /// contains no links at all.
+    pub seed_from_sitemap: bool,
 }
 
 impl Default for CrawlConfig {
@@ -107,6 +113,7 @@ impl Default for CrawlConfig {
             respect_robots: true,
             same_domain_only: false,
             max_body_bytes: 5 * 1024 * 1024,
+            seed_from_sitemap: false,
         }
     }
 }
@@ -221,6 +228,31 @@ fn looks_like_html(content_type: &str) -> bool {
 /// Fetch one page, rejecting error statuses, non-HTML bodies, and oversized
 /// responses. The body is streamed so a huge file is abandoned rather than
 /// buffered in full.
+/// Fetch a URL as raw bytes, with the status and size guards but no content-type
+/// gate. Sitemaps are XML and frequently gzipped, so they cannot go through
+/// `fetch_page`.
+pub async fn fetch_bytes(
+    client: &Client,
+    url: &Url,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, CrawlError> {
+    let mut response = client.get(url.clone()).send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(CrawlError::Status(status.as_u16()));
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > max_body_bytes {
+            return Err(CrawlError::TooLarge(max_body_bytes));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 pub async fn fetch_page(
     client: &Client,
     url: &Url,
@@ -507,7 +539,7 @@ struct CrawlState {
     seen: Mutex<HashSet<String>>,
     pages: Mutex<Vec<FetchedPage>>,
     failed: Mutex<Vec<(String, String)>>,
-    host_slot: Mutex<HashMap<String, Instant>>,
+    host_slot: HostSlots,
     robots: Mutex<HashMap<String, Option<Arc<Robot>>>>,
     active: AtomicUsize,
     claimed: AtomicUsize,
@@ -516,13 +548,26 @@ struct CrawlState {
     seed_host: String,
 }
 
-fn claim_host_slot(state: &CrawlState, host: &str, delay: Duration) -> Duration {
-    let mut slots = state.host_slot.lock().unwrap();
+pub type HostSlots = Mutex<HashMap<String, Instant>>;
+
+/// Reserve the next slot for `host`, returning how long to wait before using it.
+/// Claiming and waiting are separate so concurrent callers queue behind each
+/// other instead of all sleeping the same interval and then firing together.
+pub fn claim_slot(slots: &HostSlots, host: &str, delay: Duration) -> Duration {
+    let mut slots = slots.lock().unwrap();
     let now = Instant::now();
     let slot = slots.entry(host.to_string()).or_insert(now);
     let wait = slot.saturating_duration_since(now);
     *slot = (*slot).max(now) + delay;
     wait
+}
+
+/// Wait out this host's rate limit before issuing a request.
+pub async fn throttle(slots: &HostSlots, host: &str, delay: Duration) {
+    let wait = claim_slot(slots, host, delay);
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
 }
 
 async fn robots_for(
@@ -569,11 +614,7 @@ async fn process_one(
         return;
     }
 
-    let host = host_of(&url);
-    let wait = claim_host_slot(state, &host, cfg.per_host_delay);
-    if !wait.is_zero() {
-        tokio::time::sleep(wait).await;
-    }
+    throttle(&state.host_slot, &host_of(&url), cfg.per_host_delay).await;
 
     match fetch_page(client, &url, cfg.max_body_bytes).await {
         Ok(html) => {
@@ -656,9 +697,31 @@ pub async fn crawl(
 ) -> Result<CrawlOutcome, CrawlError> {
     let seed_url = canonicalize(seed)?;
 
+    let mut frontier = VecDeque::from([(seed_url.clone(), 0)]);
+    let mut seen = HashSet::from([dedup_key(&seed_url)]);
+
+    if cfg.seed_from_sitemap {
+        // Only ever fetch as many sitemap URLs as the page budget can consume.
+        let sitemap_cfg = crate::sitemap::SitemapConfig {
+            max_urls: cfg.max_pages,
+            per_host_delay: cfg.per_host_delay,
+            ..Default::default()
+        };
+        if let Ok(outcome) = crate::sitemap::collect(client, seed_url.as_str(), &sitemap_cfg).await {
+            for entry in outcome.entries {
+                if cfg.same_domain_only && host_of(&entry.url) != host_of(&seed_url) {
+                    continue;
+                }
+                if seen.insert(dedup_key(&entry.url)) {
+                    frontier.push_back((entry.url, 0));
+                }
+            }
+        }
+    }
+
     let state = CrawlState {
-        frontier: Mutex::new(VecDeque::from([(seed_url.clone(), 0)])),
-        seen: Mutex::new(HashSet::from([dedup_key(&seed_url)])),
+        frontier: Mutex::new(frontier),
+        seen: Mutex::new(seen),
         pages: Mutex::new(Vec::new()),
         failed: Mutex::new(Vec::new()),
         host_slot: Mutex::new(HashMap::new()),

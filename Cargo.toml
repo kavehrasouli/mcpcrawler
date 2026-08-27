@@ -16,3 +16,5 @@ htmd            = "0.1"
 texting_robots = "0.2.2"
 chromiumoxide = { version = "0.9", default-features = false, features = ["bytes"] }
 ego-tree = "0.10"
+quick-xml = "0.42.0"
+flate2 = "1.1.9"

@@ -9,6 +9,7 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     schemars, tool,
 };
+use crate::sitemap::{self, SitemapConfig};
 use serde::Deserialize;
 use std::time::Duration;
 use url::Url;
@@ -99,6 +100,12 @@ pub struct CrawlInput {
     #[schemars(description = "Honor robots.txt. Default true.")]
     #[serde(default)]
     pub respect_robots: Option<bool>,
+    #[schemars(
+        description = "Seed the crawl from the site's sitemap. Required for client-rendered \
+                       sites, whose HTML contains no links to follow. Default false."
+    )]
+    #[serde(default)]
+    pub seed_from_sitemap: Option<bool>,
 }
 
 impl CrawlInput {
@@ -113,6 +120,7 @@ impl CrawlInput {
                 .unwrap_or(d.per_host_delay),
             max_depth: self.depth.unwrap_or(d.max_depth).clamp(1, 20),
             respect_robots: self.respect_robots.unwrap_or(d.respect_robots),
+            seed_from_sitemap: self.seed_from_sitemap.unwrap_or(false),
             ..d
         }
     }
@@ -154,6 +162,36 @@ pub struct FetchInput {
     #[schemars(description = "Render with a headless browser first, for JS-built pages. Default false.")]
     #[serde(default)]
     pub headless: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SitemapInput {
+    #[schemars(description = "A site (its sitemaps are discovered via robots.txt) or a sitemap URL")]
+    pub url: String,
+    #[schemars(
+        description = "Keep only URLs containing this substring, case-insensitive. Applied while \
+                       walking, so a filtered scan reaches much deeper into a large index."
+    )]
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[schemars(description = "Maximum URLs to collect. Default 5000.")]
+    #[serde(default)]
+    pub max_urls: Option<usize>,
+    #[schemars(description = "Maximum sitemap documents to read. Default 50.")]
+    #[serde(default)]
+    pub max_sitemaps: Option<usize>,
+}
+
+impl SitemapInput {
+    fn config(&self) -> SitemapConfig {
+        let d = SitemapConfig::default();
+        SitemapConfig {
+            max_urls: self.max_urls.unwrap_or(d.max_urls).clamp(1, 200_000),
+            max_sitemaps: self.max_sitemaps.unwrap_or(d.max_sitemaps).clamp(1, 2_000),
+            contains: self.contains.clone().filter(|c| !c.is_empty()),
+            ..d
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -267,6 +305,56 @@ impl Crawler {
         match self.html_for(&input.url, input.headless.unwrap_or(false)).await {
             Ok(html) => cap(extract_metadata(&html)),
             Err(e) => format!("Failed to fetch {}: {e}", input.url),
+        }
+    }
+
+    #[tool(
+        description = "List the URLs a site publishes in its sitemap. Far cheaper and far more \
+                       complete than crawling, and it is the only way to enumerate a \
+                       client-rendered site whose HTML contains no links. Use `contains` to \
+                       filter a large index."
+    )]
+    async fn list_sitemap_urls(&self, #[tool(aggr)] input: SitemapInput) -> String {
+        match sitemap::collect(&self.client, &input.url, &input.config()).await {
+            Ok(outcome) => {
+                let urls = outcome.urls();
+                let mut out = format!(
+                    "{} URL(s) from {} sitemap(s).{}{}\n\n",
+                    urls.len(),
+                    outcome.sitemaps_read,
+                    match &input.contains {
+                        Some(c) if !c.is_empty() => format!(" Filtered by \"{c}\"."),
+                        _ => String::new(),
+                    },
+                    match (outcome.truncated, outcome.sitemaps_pending) {
+                        (true, 0) => " Stopped at the URL budget — raise max_urls for more.".into(),
+                        (_, pending) if pending > 0 => format!(
+                            " Partial: {pending} sitemap(s) left unread. Raise max_urls and \
+                             max_sitemaps, or narrow the search with `contains`."
+                        ),
+                        _ => String::new(),
+                    }
+                );
+                // lastmod tells the model which pages are worth revisiting.
+                let lines: Vec<String> = outcome
+                    .entries
+                    .iter()
+                    .map(|e| match &e.lastmod {
+                        Some(when) => format!("{}  [{when}]", e.url),
+                        None => e.url.to_string(),
+                    })
+                    .collect();
+                out.push_str(&list_urls(&lines));
+
+                if !outcome.failed.is_empty() {
+                    out.push_str("\n\nFailed:\n");
+                    for (url, err) in outcome.failed.iter().take(20) {
+                        out.push_str(&format!("{url} — {err}\n"));
+                    }
+                }
+                cap(out)
+            }
+            Err(e) => format!("Could not read sitemap: {e}"),
         }
     }
 
