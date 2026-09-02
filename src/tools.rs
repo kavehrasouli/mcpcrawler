@@ -6,10 +6,12 @@ use crate::crawler::{
 use reqwest::Client;
 use rmcp::{
     ServerHandler,
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool,
+    handler::server::wrapper::Parameters,
+    model::{Implementation, ServerCapabilities, ServerInfo},
+    schemars, tool, tool_handler, tool_router,
 };
 use crate::sitemap::{self, SitemapConfig};
+use crate::structured::{self, StructuredData};
 use serde::Deserialize;
 use std::time::Duration;
 use url::Url;
@@ -21,6 +23,12 @@ const MAX_OUTPUT_CHARS: usize = 60_000;
 const MAX_LISTED: usize = 400;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
+
+/// How deep a state blob is outlined: enough to show where the data sits, not
+/// so much that the outline becomes the dump it exists to avoid.
+const STATE_OUTLINE_DEPTH: u32 = 3;
+/// Ceiling on URLs harvested out of one state blob.
+const MAX_STATE_URLS: usize = 1_000;
 
 fn cap(mut text: String) -> String {
     if text.chars().count() <= MAX_OUTPUT_CHARS {
@@ -48,10 +56,64 @@ fn list_urls(urls: &[String]) -> String {
     out
 }
 
+fn structured_report(data: &StructuredData, base: &Url) -> String {
+    if data.is_empty() {
+        return "No structured data: the page publishes no JSON-LD records and no embedded \
+                framework state. Use fetch_content for its text, or headless=true if it builds \
+                itself client-side."
+            .to_string();
+    }
+
+    let mut out = format!(
+        "{} JSON-LD record(s); {} embedded state blob(s).\n\n",
+        data.json_ld.len(),
+        data.embedded.len()
+    );
+
+    if !data.json_ld.is_empty() {
+        out.push_str("## JSON-LD\n\n");
+        out.push_str(&structured::render_records(&data.json_ld));
+    }
+
+    for state in &data.embedded {
+        out.push_str(&format!(
+            "## {} — {:.1} KB of JSON\n\n{}\n\n",
+            state.name,
+            state.raw_len as f64 / 1024.0,
+            structured::render_outline(&state.value, STATE_OUTLINE_DEPTH)
+        ));
+
+        // The point of the blob on a link-less page: the URLs its HTML omits.
+        let urls: Vec<String> = structured::urls_in(&state.value, base, MAX_STATE_URLS)
+            .iter()
+            .map(Url::to_string)
+            .collect();
+        if !urls.is_empty() {
+            out.push_str(&format!(
+                "### {} URL(s) referenced in {}\n\n{}\n\n",
+                urls.len(),
+                state.name,
+                list_urls(&urls)
+            ));
+        }
+    }
+
+    out
+}
+
 fn report(outcome: &CrawlOutcome) -> String {
     let urls = outcome.urls();
+    // Where the URLs came from, not which URL came from where: naming the
+    // parent of every link would be most of the output and none of the value.
+    let origins = outcome
+        .origin_counts()
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let mut out = format!(
-        "Fetched {} page(s); {} failed; {} skipped by robots.txt.{}\n\n",
+        "Fetched {} page(s); {} failed; {} skipped by robots.txt.{}\nFound via: {origins}.\n\n",
         urls.len(),
         outcome.failed.len(),
         outcome.robots_skipped,
@@ -208,6 +270,13 @@ pub struct Crawler {
 }
 
 impl Crawler {
+    pub fn new() -> Self {
+        Self {
+            client: build_client(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .expect("HTTP client configuration is static and always valid"),
+        }
+    }
+
     /// Retrieve HTML for a single URL, via the browser when asked.
     async fn html_for(&self, url: &str, headless: bool) -> Result<String, CrawlError> {
         if headless {
@@ -219,17 +288,11 @@ impl Crawler {
     }
 }
 
-#[tool(tool_box)]
+#[tool_router]
 impl Crawler {
-    pub fn new() -> Self {
-        Self {
-            client: build_client(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-                .expect("HTTP client configuration is static and always valid"),
-        }
-    }
 
     #[tool(description = "Crawl a website and return the URLs that were successfully fetched")]
-    async fn crawl_site(&self, #[tool(aggr)] input: CrawlInput) -> String {
+    async fn crawl_site(&self, Parameters(input): Parameters<CrawlInput>) -> String {
         match crawl(&self.client, &input.url, &input.config()).await {
             Ok(outcome) => report(&outcome),
             Err(e) => format!("Crawl failed: {e}"),
@@ -237,7 +300,7 @@ impl Crawler {
     }
 
     #[tool(description = "Crawl a website, following only links on the same domain")]
-    async fn crawl_site_same_domain(&self, #[tool(aggr)] input: CrawlInput) -> String {
+    async fn crawl_site_same_domain(&self, Parameters(input): Parameters<CrawlInput>) -> String {
         match crawl_same_domain(&self.client, &input.url, &input.config()).await {
             Ok(outcome) => report(&outcome),
             Err(e) => format!("Crawl failed: {e}"),
@@ -245,7 +308,7 @@ impl Crawler {
     }
 
     #[tool(description = "Fetch the readable text content of a single URL")]
-    async fn fetch_content(&self, #[tool(aggr)] input: FetchInput) -> String {
+    async fn fetch_content(&self, Parameters(input): Parameters<FetchInput>) -> String {
         match self.html_for(&input.url, input.headless.unwrap_or(false)).await {
             Ok(html) => cap(extract_text(&html)),
             Err(e) => format!("Failed to fetch {}: {e}", input.url),
@@ -253,7 +316,7 @@ impl Crawler {
     }
 
     #[tool(description = "Fetch the content of a single URL as markdown")]
-    async fn fetch_content_in_md(&self, #[tool(aggr)] input: FetchInput) -> String {
+    async fn fetch_content_in_md(&self, Parameters(input): Parameters<FetchInput>) -> String {
         match self.html_for(&input.url, input.headless.unwrap_or(false)).await {
             Ok(html) => cap(extract_text_md(&html)),
             Err(e) => format!("Failed to fetch {}: {e}", input.url),
@@ -261,7 +324,7 @@ impl Crawler {
     }
 
     #[tool(description = "Crawl a website and return pages whose text contains a keyword, with match counts and snippets")]
-    async fn search_site_keyword(&self, #[tool(aggr)] input: SearchInput) -> String {
+    async fn search_site_keyword(&self, Parameters(input): Parameters<SearchInput>) -> String {
         match search_site(&self.client, &input.url, &input.keyword, &input.config()).await {
             Ok((matches, outcome)) => {
                 let mut out = format!(
@@ -285,7 +348,7 @@ impl Crawler {
     }
 
     #[tool(description = "Extract all links from a single URL")]
-    async fn extract_all_links(&self, #[tool(aggr)] input: FetchInput) -> String {
+    async fn extract_all_links(&self, Parameters(input): Parameters<FetchInput>) -> String {
         let base = match canonicalize(&input.url) {
             Ok(url) => url,
             Err(e) => return format!("Failed to read {}: {e}", input.url),
@@ -301,9 +364,27 @@ impl Crawler {
     }
 
     #[tool(description = "Extract metadata (title, description, author, canonical URL, publish date) from a URL")]
-    async fn extract_meta(&self, #[tool(aggr)] input: FetchInput) -> String {
+    async fn extract_meta(&self, Parameters(input): Parameters<FetchInput>) -> String {
         match self.html_for(&input.url, input.headless.unwrap_or(false)).await {
             Ok(html) => cap(extract_metadata(&html)),
+            Err(e) => format!("Failed to fetch {}: {e}", input.url),
+        }
+    }
+
+    #[tool(
+        description = "Extract the structured data a page already ships in its HTML: schema.org \
+                       JSON-LD records, and embedded framework state (__NEXT_DATA__, Nuxt, a \
+                       preloaded Redux or Apollo store). This is how to read a client-rendered \
+                       page's data without paying for a browser, and it returns records — dates, \
+                       names, prices, identifiers — rather than prose."
+    )]
+    async fn extract_structured_data(&self, Parameters(input): Parameters<FetchInput>) -> String {
+        let base = match canonicalize(&input.url) {
+            Ok(url) => url,
+            Err(e) => return format!("Failed to read {}: {e}", input.url),
+        };
+        match self.html_for(&input.url, input.headless.unwrap_or(false)).await {
+            Ok(html) => cap(structured_report(&structured::extract(&html), &base)),
             Err(e) => format!("Failed to fetch {}: {e}", input.url),
         }
     }
@@ -314,7 +395,7 @@ impl Crawler {
                        client-rendered site whose HTML contains no links. Use `contains` to \
                        filter a large index."
     )]
-    async fn list_sitemap_urls(&self, #[tool(aggr)] input: SitemapInput) -> String {
+    async fn list_sitemap_urls(&self, Parameters(input): Parameters<SitemapInput>) -> String {
         match sitemap::collect(&self.client, &input.url, &input.config()).await {
             Ok(outcome) => {
                 let urls = outcome.urls();
@@ -361,7 +442,7 @@ impl Crawler {
     #[tool(
         description = "Login to a website using credentials from passmanager. The master password is read from the MCPCRAWLER_MASTER_PASSWORD environment variable, never passed as an argument."
     )]
-    async fn login_to_site(&self, #[tool(aggr)] input: LoginInput) -> String {
+    async fn login_to_site(&self, Parameters(input): Parameters<LoginInput>) -> String {
         let Ok(master_password) = std::env::var("MCPCRAWLER_MASTER_PASSWORD") else {
             return "MCPCRAWLER_MASTER_PASSWORD is not set. Set it in the server's environment \
                     so the master password never passes through the model's context."
@@ -378,18 +459,20 @@ impl Crawler {
     }
 }
 
-#[tool(tool_box)]
+#[tool_handler]
 impl ServerHandler for Crawler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "A web crawler. Crawls are bounded by a page budget (max_pages), a per-host \
-                 rate limit, and robots.txt — depth is only a guard rail, not the main control. \
-                 Tools report fetched and failed URLs separately."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        // Without this the client is told it is talking to "rmcp", because the
+        // SDK's own build environment is what `Implementation::default()` reads.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+            "A web crawler. Crawls are bounded by a page budget (max_pages), a per-host \
+             rate limit, and robots.txt — depth is only a guard rail, not the main control. \
+             Tools report fetched and failed URLs separately.",
+        )
     }
 }

@@ -56,6 +56,8 @@ pub enum CrawlError {
     TooLarge(usize),
     Browser(String),
     Parse(String),
+    Blocked(String),
+    Json(String),
 }
 
 impl fmt::Display for CrawlError {
@@ -69,6 +71,8 @@ impl fmt::Display for CrawlError {
             CrawlError::TooLarge(n) => write!(f, "page exceeds the {n} byte limit"),
             CrawlError::Browser(e) => write!(f, "headless browser failed: {e}"),
             CrawlError::Parse(e) => write!(f, "could not parse XML: {e}"),
+            CrawlError::Blocked(why) => write!(f, "destination refused: {why}"),
+            CrawlError::Json(e) => write!(f, "response was not the expected JSON: {e}"),
         }
     }
 }
@@ -77,7 +81,17 @@ impl std::error::Error for CrawlError {}
 
 impl From<reqwest::Error> for CrawlError {
     fn from(e: reqwest::Error) -> Self {
-        CrawlError::Transport(e.to_string())
+        // reqwest's own Display says only "error sending request". The reason —
+        // a refused destination, a DNS failure, a TLS error — is down the
+        // source chain, and without it every guard rejection is indistinguish-
+        // able from the network being down.
+        let mut message = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            message.push_str(&format!(": {cause}"));
+            source = cause.source();
+        }
+        CrawlError::Transport(message)
     }
 }
 
@@ -119,12 +133,21 @@ impl Default for CrawlConfig {
 }
 
 pub fn build_client(request_timeout: Duration) -> Result<Client, reqwest::Error> {
+    let policy = crate::net::policy();
     Client::builder()
         .user_agent(USER_AGENT)
         .timeout(request_timeout)
         .connect_timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        // Both guards are needed: the resolver judges hosts that get looked up,
+        // the redirect policy judges hops that name an address outright.
+        .dns_resolver(crate::net::resolver(policy))
+        .redirect(crate::net::redirect_policy(policy))
         .build()
+}
+
+/// Refuse a destination the policy disallows before spending a request on it.
+pub(crate) fn allowed(url: &Url) -> Result<(), CrawlError> {
+    crate::net::policy().check_url(url).map_err(CrawlError::Blocked)
 }
 
 // *** URL handling ***
@@ -236,6 +259,7 @@ pub async fn fetch_bytes(
     url: &Url,
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, CrawlError> {
+    allowed(url)?;
     let mut response = client.get(url.clone()).send().await?;
 
     let status = response.status();
@@ -258,6 +282,7 @@ pub async fn fetch_page(
     url: &Url,
     max_body_bytes: usize,
 ) -> Result<String, CrawlError> {
+    allowed(url)?;
     let mut response = client.get(url.clone()).send().await?;
 
     let status = response.status();
@@ -517,6 +542,58 @@ pub async fn login_and_fetch(
 pub struct FetchedPage {
     pub url: Url,
     pub html: String,
+    /// How this URL entered the frontier.
+    pub origin: Origin,
+}
+
+/// Where a candidate URL came from.
+///
+/// A single-seed crawl barely needs this — everything is the seed or a link off
+/// it. Federated discovery does: candidates arrive from several backends at
+/// once, and a merged frontier that cannot say which backend produced a URL has
+/// thrown away the one thing that makes the merge auditable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// Supplied by the caller.
+    Seed,
+    /// Listed in the site's sitemap.
+    Sitemap,
+    /// Linked from a page this crawl already fetched.
+    Link { from: Url },
+    /// Returned by a named discovery source. Constructed by the federation
+    /// layer, which is why nothing in the crawler itself builds one yet.
+    #[allow(dead_code)]
+    Source(Arc<str>),
+}
+
+impl Origin {
+    /// The grouping label, without the parent URL a `Link` carries — a summary
+    /// wants "412 from links", not 412 distinct parents.
+    pub fn kind(&self) -> String {
+        match self {
+            Origin::Seed => "seed".to_string(),
+            Origin::Sitemap => "sitemap".to_string(),
+            Origin::Link { .. } => "link".to_string(),
+            Origin::Source(name) => format!("source:{name}"),
+        }
+    }
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Origin::Link { from } => write!(f, "link from {from}"),
+            other => write!(f, "{}", other.kind()),
+        }
+    }
+}
+
+/// A URL waiting to be fetched, with everything the crawl knows about it.
+#[derive(Debug, Clone)]
+struct Candidate {
+    url: Url,
+    depth: u32,
+    origin: Origin,
 }
 
 #[derive(Debug, Default)]
@@ -532,10 +609,21 @@ impl CrawlOutcome {
     pub fn urls(&self) -> Vec<String> {
         self.pages.iter().map(|p| p.url.to_string()).collect()
     }
+
+    /// Fetched pages counted by where their URL came from, largest group first.
+    pub fn origin_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for page in &self.pages {
+            *counts.entry(page.origin.kind()).or_default() += 1;
+        }
+        let mut counts: Vec<(String, usize)> = counts.into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts
+    }
 }
 
 struct CrawlState {
-    frontier: Mutex<VecDeque<(Url, u32)>>,
+    frontier: Mutex<VecDeque<Candidate>>,
     seen: Mutex<HashSet<String>>,
     pages: Mutex<Vec<FetchedPage>>,
     failed: Mutex<Vec<(String, String)>>,
@@ -545,7 +633,9 @@ struct CrawlState {
     claimed: AtomicUsize,
     robots_skipped: AtomicUsize,
     budget_hit: AtomicBool,
-    seed_host: String,
+    /// Every host the caller seeded. With one seed this is the old `seed_host`;
+    /// with a federated frontier there is no single host to compare against.
+    seed_hosts: HashSet<String>,
 }
 
 pub type HostSlots = Mutex<HashMap<String, Instant>>;
@@ -599,13 +689,8 @@ async fn robots_for(
     parsed
 }
 
-async fn process_one(
-    client: &Client,
-    state: &CrawlState,
-    cfg: &CrawlConfig,
-    url: Url,
-    depth: u32,
-) {
+async fn process_one(client: &Client, state: &CrawlState, cfg: &CrawlConfig, item: Candidate) {
+    let Candidate { url, depth, origin } = item;
     if cfg.respect_robots
         && let Some(robot) = robots_for(client, state, &url).await
         && !robot.allowed(url.as_str())
@@ -625,15 +710,19 @@ async fn process_one(
                     if is_blocked(&link) {
                         continue;
                     }
-                    if cfg.same_domain_only && host_of(&link) != state.seed_host {
+                    if cfg.same_domain_only && !state.seed_hosts.contains(&host_of(&link)) {
                         continue;
                     }
                     if seen.insert(dedup_key(&link)) {
-                        frontier.push_back((link, depth + 1));
+                        frontier.push_back(Candidate {
+                            url: link,
+                            depth: depth + 1,
+                            origin: Origin::Link { from: url.clone() },
+                        });
                     }
                 }
             }
-            state.pages.lock().unwrap().push(FetchedPage { url, html });
+            state.pages.lock().unwrap().push(FetchedPage { url, html, origin });
         }
         Err(e) => {
             // Recorded separately so a failed fetch is never reported as visited.
@@ -662,7 +751,7 @@ async fn worker(client: &Client, state: &CrawlState, cfg: &CrawlConfig) {
             }
         };
 
-        let (url, depth) = match next {
+        let item = match next {
             Some(item) => item,
             None => {
                 if state.active.load(Ordering::SeqCst) == 0 {
@@ -680,7 +769,7 @@ async fn worker(client: &Client, state: &CrawlState, cfg: &CrawlConfig) {
             return;
         }
 
-        process_one(client, state, cfg, url, depth).await;
+        process_one(client, state, cfg, item).await;
 
         // Links are queued inside process_one, so the counter drops only after
         // any children are visible to peers.
@@ -696,24 +785,63 @@ pub async fn crawl(
     cfg: &CrawlConfig,
 ) -> Result<CrawlOutcome, CrawlError> {
     let seed_url = canonicalize(seed)?;
+    crawl_from(client, vec![(seed_url, Origin::Seed)], cfg).await
+}
 
-    let mut frontier = VecDeque::from([(seed_url.clone(), 0)]);
-    let mut seen = HashSet::from([dedup_key(&seed_url)]);
+/// Crawl from many seeds at once, each carrying where it came from.
+///
+/// This is the entry point a federated frontier needs: discovery sources return
+/// candidate URLs across many hosts, and they all have to enter one crawl with
+/// one shared budget, one visited set and one rate limiter — running a separate
+/// crawl per source would multiply every limit by the number of sources.
+pub async fn crawl_from(
+    client: &Client,
+    seeds: Vec<(Url, Origin)>,
+    cfg: &CrawlConfig,
+) -> Result<CrawlOutcome, CrawlError> {
+    if seeds.is_empty() {
+        return Err(CrawlError::BadUrl("no seed URLs".to_string()));
+    }
+
+    let mut frontier: VecDeque<Candidate> = VecDeque::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut seed_hosts: HashSet<String> = HashSet::new();
+
+    for (url, origin) in seeds {
+        seed_hosts.insert(host_of(&url));
+        if seen.insert(dedup_key(&url)) {
+            frontier.push_back(Candidate { url, depth: 0, origin });
+        }
+    }
 
     if cfg.seed_from_sitemap {
-        // Only ever fetch as many sitemap URLs as the page budget can consume.
-        let sitemap_cfg = crate::sitemap::SitemapConfig {
-            max_urls: cfg.max_pages,
-            per_host_delay: cfg.per_host_delay,
-            ..Default::default()
-        };
-        if let Ok(outcome) = crate::sitemap::collect(client, seed_url.as_str(), &sitemap_cfg).await {
+        // Every seed host contributes, but out of one shared budget rather than
+        // `max_pages` each — the crawl can only ever fetch `max_pages` anyway.
+        let hosts: Vec<Url> = distinct_host_roots(&frontier);
+        for root in hosts {
+            let remaining = cfg.max_pages.saturating_sub(frontier.len());
+            if remaining == 0 {
+                break;
+            }
+            let sitemap_cfg = crate::sitemap::SitemapConfig {
+                max_urls: remaining,
+                per_host_delay: cfg.per_host_delay,
+                ..Default::default()
+            };
+            let Ok(outcome) = crate::sitemap::collect(client, root.as_str(), &sitemap_cfg).await
+            else {
+                continue;
+            };
             for entry in outcome.entries {
-                if cfg.same_domain_only && host_of(&entry.url) != host_of(&seed_url) {
+                if cfg.same_domain_only && !seed_hosts.contains(&host_of(&entry.url)) {
                     continue;
                 }
                 if seen.insert(dedup_key(&entry.url)) {
-                    frontier.push_back((entry.url, 0));
+                    frontier.push_back(Candidate {
+                        url: entry.url,
+                        depth: 0,
+                        origin: Origin::Sitemap,
+                    });
                 }
             }
         }
@@ -730,7 +858,7 @@ pub async fn crawl(
         claimed: AtomicUsize::new(0),
         robots_skipped: AtomicUsize::new(0),
         budget_hit: AtomicBool::new(false),
-        seed_host: host_of(&seed_url),
+        seed_hosts,
     };
 
     let workers = cfg.max_concurrency.max(1);
@@ -742,6 +870,17 @@ pub async fn crawl(
         robots_skipped: state.robots_skipped.load(Ordering::SeqCst),
         budget_hit: state.budget_hit.load(Ordering::SeqCst),
     })
+}
+
+/// One URL per distinct host, so a sitemap is looked up once per site however
+/// many seeds landed on it.
+fn distinct_host_roots(frontier: &VecDeque<Candidate>) -> Vec<Url> {
+    let mut seen = HashSet::new();
+    frontier
+        .iter()
+        .filter(|c| seen.insert(host_of(&c.url)))
+        .map(|c| c.url.clone())
+        .collect()
 }
 
 pub async fn crawl_same_domain(
@@ -932,15 +1071,28 @@ pub fn extract_metadata(html: &str) -> String {
         .map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string())
         .unwrap_or_default();
 
+    // A page that renders its content client-side often has no meta tags worth
+    // reading, yet still publishes the same facts as JSON-LD for search engines.
+    // Fall back to the record rather than reporting the field as absent.
+    let structured = crate::structured::extract(html);
+    let or_schema = |value: String, keys: &[&str]| -> String {
+        if value.is_empty() {
+            structured.field(keys).unwrap_or_default()
+        } else {
+            value
+        }
+    };
+
     [
-        ("Title", title),
-        ("Description", content(&DESC)),
-        ("Author", content(&AUTHOR)),
+        ("Title", or_schema(title, &["headline", "name"])),
+        ("Description", or_schema(content(&DESC), &["description"])),
+        ("Author", or_schema(content(&AUTHOR), &["author", "creator"])),
         ("Keywords", content(&KEYWORDS)),
         ("OG Title", content(&OG_TITLE)),
         ("OG Description", content(&OG_DESC)),
-        ("Canonical", content(&CANONICAL)),
-        ("Published", content(&PUBLISHED)),
+        ("Canonical", or_schema(content(&CANONICAL), &["url"])),
+        ("Published", or_schema(content(&PUBLISHED), &["datePublished", "dateCreated"])),
+        ("Schema types", structured.schema_types().join(", ")),
     ]
     .iter()
     .filter(|(_, v)| !v.is_empty())

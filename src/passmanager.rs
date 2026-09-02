@@ -1,4 +1,4 @@
-use rmcp::{ServiceExt, model::CallToolRequestParam};
+use rmcp::{ServiceExt, model::CallToolRequestParams};
 use tokio::process::Command;
 use std::process::Stdio;
 
@@ -16,13 +16,17 @@ pub async fn get_credential(site: &str, master_password: &str) -> Option<(String
     
     let client = ().serve((stdout, stdin)).await.ok()?;
 
-    let result = client.call_tool(CallToolRequestParam {
-        name: "get_credential".into(),
-        arguments: Some(serde_json::json!({
-            "site": site,
-            "master_password": master_password
-        }).as_object().cloned().unwrap()),
-    }).await.ok()?;
+    let arguments = serde_json::json!({
+        "site": site,
+        "master_password": master_password
+    })
+    .as_object()
+    .cloned()?;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("get_credential").with_arguments(arguments))
+        .await
+        .ok()?;
 
     let text = result.content.first()?.as_text()?.text.clone();
 

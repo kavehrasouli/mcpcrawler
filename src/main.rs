@@ -1,6 +1,9 @@
+mod api;
 mod crawler;
+mod net;
 mod passmanager;
 mod sitemap;
+mod structured;
 mod tools;
 
 use rmcp::ServiceExt;
@@ -12,6 +15,9 @@ mod tests;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Fixed for the life of the process, before anything can fetch.
+    net::init(net::NetPolicy::from_env());
+
     let service = match Crawler::new().serve((stdin(), stdout())).await {
         Ok(service) => service,
         Err(e) => {
