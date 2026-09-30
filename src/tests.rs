@@ -1,5 +1,8 @@
 use crate::api;
 use crate::crawler::*;
+use crate::discovery::{DiscoveryBudget, DiscoverySource, Found, Lead, Query, federate};
+use crate::scoring::{LinkContext, ON_TOPIC, Shape, Terms, score_link};
+use crate::sources::{brave::Brave, gdelt::Gdelt, wayback::Wayback, wikidata::Wikidata};
 use crate::net::{self, NetPolicy};
 use crate::structured;
 use std::collections::HashMap;
@@ -126,11 +129,136 @@ fn body_for(path: &str) -> (u16, &'static str, Vec<u8>) {
         "/d2" => (200, "text/html", r#"<html><body><main>two <a href="/d3">three</a></main></body></html>"#.into()),
         "/d3" => (200, "text/html", "<html><body><main>three</main></body></html>".into()),
         "/secret" => (200, "text/html", "<html><body><main>classified</main></body></html>".into()),
+        // A hub page of the kind a focused crawl has to triage: the useful
+        // link is neither first nor obviously labelled.
+        "/hub" => (
+            200,
+            "text/html",
+            r#"<html><body><main>
+                 <a href="/cookie-policy">Cookie policy</a>
+                 <a href="/contact">Contact us</a>
+                 <a href="/press/2019/">Press releases 2019</a>
+               </main></body></html>"#
+                .into(),
+        ),
+        "/cookie-policy" => (
+            200,
+            "text/html",
+            "<html><body><main>We use cookies on this website.</main></body></html>".into(),
+        ),
+        "/contact" => (200, "text/html", "<html><body><main>Contact us.</main></body></html>".into()),
+        "/press/2019/" => (
+            200,
+            "text/html",
+            r#"<html><body><main><p>Japarov visited Ankara in 2019.</p>
+                 <a href="/press/2019/page/2" rel="next">Next</a></main></body></html>"#
+                .into(),
+        ),
+        "/press/2019/page/2" => (
+            200,
+            "text/html",
+            "<html><body><main>Japarov met the Turkish president.</main></body></html>".into(),
+        ),
+        // A dull index that names nothing, holding a link that names nothing,
+        // leading to the page that does. Without tunnelling this is a dead end.
+        "/dull" => (
+            200,
+            "text/html",
+            r#"<html><body><main>Site index. <a href="/q/target">Read more</a></main></body></html>"#
+                .into(),
+        ),
+        // Non-Latin text long enough to force truncation, and a Turkish capital
+        // İ, whose lowercase form is two characters. Both used to panic.
+        "/cyrillic" => (
+            200,
+            "text/html",
+            format!(
+                r#"<html><body><main><p>İstanbul ziyareti.</p>
+                   <a href="/q/target">{}</a></main></body></html>"#,
+                "Садыр Жапаров встретился с делегацией ".repeat(20)
+            )
+            .into_bytes(),
+        ),
+        "/q/target" => (
+            200,
+            "text/html",
+            "<html><body><main>Садыр Жапаров met the delegation.</main></body></html>".into(),
+        ),
         "/report.pdf" => (200, "application/pdf", "%PDF-1.4 not html".into()),
         // Served as text/plain on purpose: GDELT does exactly this, and the
         // HTML content-type gate must not be in the way of a JSON fetch.
         "/api.json" => (200, "text/plain", r#"{"ok":true,"items":[1,2,3]}"#.into()),
         "/api-bad.json" => (200, "application/json", "not json at all".into()),
+        // GDELT-shaped responses. The last two are the cases its documentation
+        // does not mention: no matches, and the rate-limit notice.
+        "/gdelt" => (
+            200,
+            "application/json",
+            r#"{"articles": [
+                 {"url": "https://example.org/first", "title": "First report",
+                  "seendate": "20260827T081500Z", "domain": "example.org", "language": "English"},
+                 {"url": "https://example.org/second", "title": "Second report",
+                  "seendate": "20260826T101500Z", "domain": "example.org", "language": "Spanish"},
+                 {"url": "https://example.org/third?utm_source=gdelt", "title": "Third report",
+                  "seendate": "20260825T090000Z", "domain": "example.org", "language": "Serbian"}
+               ]}"#
+                .into(),
+        ),
+        "/gdelt-empty" => (200, "application/json", "{}".into()),
+        // Wikidata answers two different calls on one endpoint, told apart by
+        // the `action` parameter; the fixture routes on path, so they are split
+        // into two paths here and the source is pointed at each in turn.
+        "/wd-search" => (
+            200,
+            "application/json",
+            r#"{"search": [{"id": "Q25597826", "label": "Sadyr Japarov",
+                            "description": "President of Kyrgyzstan"}]}"#
+                .into(),
+        ),
+        "/wd-search-empty" => (200, "application/json", r#"{"search": []}"#.into()),
+        "/wd-entity" => (
+            200,
+            "application/json",
+            r#"{"entities": {"Q25597826": {
+                 "labels": {"en": {"language": "en", "value": "Sadyr Japarov"}},
+                 "aliases": {"en": [{"language": "en", "value": "Sadyr Zhaparov"}]},
+                 "claims": {"P856": [{"mainsnak": {"datavalue": {"value": "https://president.kg/"}}}]},
+                 "sitelinks": {
+                   "enwiki": {"site": "enwiki", "title": "Sadyr Japarov",
+                              "url": "https://en.wikipedia.org/wiki/Sadyr_Japarov"},
+                   "kywiki": {"site": "kywiki", "title": "Жапаров Садыр",
+                              "url": "https://ky.wikipedia.org/wiki/Sadyr"},
+                   "commonswiki": {"site": "commonswiki", "title": "Category:Sadyr",
+                                   "url": "https://commons.wikimedia.org/wiki/Category:Sadyr"}
+                 }}}}"#
+                .into(),
+        ),
+        // CDX: array of arrays whose first row names the columns.
+        "/cdx" => (
+            200,
+            "application/json",
+            r#"[["urlkey","timestamp","original","mimetype","statuscode","digest","length"],
+                ["kg,gov,mfa)/news/1","20190104061944","http://mfa.gov.kg/news/1","text/html","200","AAA","100"],
+                ["kg,gov,mfa)/news/2","20200215120000","http://mfa.gov.kg/news/2","text/html","200","BBB","200"]]"#
+                .into(),
+        ),
+        "/cdx-empty" => (200, "application/json", "[]".into()),
+        "/brave" => (
+            200,
+            "application/json",
+            r#"{"web": {"results": [
+                 {"url": "https://example.org/one", "title": "One", "age": "2 days ago",
+                  "language": "en"},
+                 {"url": "https://example.org/two", "title": "Two"}
+               ]}}"#
+                .into(),
+        ),
+        "/gdelt-limited" => (
+            200,
+            "text/plain",
+            "Please limit requests to one every 5 seconds or contact us for larger queries."
+                .into(),
+        ),
         _ => (404, "text/html", "<html><body>not found</body></html>".into()),
     }
 }
@@ -154,12 +282,18 @@ async fn fixture() -> Fixture {
                 let mut buf = vec![0u8; 2048];
                 let Ok(n) = socket.read(&mut buf).await else { return };
                 let request = String::from_utf8_lossy(&buf[..n]);
-                let path = request
+                let target = request
                     .lines()
                     .next()
                     .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or("/")
                     .to_string();
+                // Routed and counted by path alone; the query string is still
+                // in the recorded request for tests that assert on it.
+                let (path, query) = match target.split_once('?') {
+                    Some((path, query)) => (path.to_string(), query.to_string()),
+                    None => (target.clone(), String::new()),
+                };
 
                 recorder.lock().unwrap().push(request.to_string());
                 let hit = {
@@ -174,6 +308,10 @@ async fn fixture() -> Fixture {
                     // state, which a pure `body_for` cannot have.
                     "/flaky.json" if hit == 1 => (503, "application/json", b"{}".to_vec()),
                     "/flaky.json" => (200, "application/json", br#"{"recovered":true}"#.to_vec()),
+                    // Wikidata serves both of its calls from one endpoint and
+                    // tells them apart by `action`, so the fixture does too.
+                    "/wd" if query.contains("wbsearchentities") => body_for("/wd-search"),
+                    "/wd" if query.contains("wbgetentities") => body_for("/wd-entity"),
                     _ => body_for(&path),
                 };
                 let header = format!(
@@ -741,8 +879,8 @@ async fn crawl_from_merges_seeds_into_one_budget_and_keeps_provenance() {
     let client = test_client();
 
     let seeds = vec![
-        (canonicalize(&server.url("/alpha")).unwrap(), Origin::Seed),
-        (canonicalize(&server.url("/d1")).unwrap(), Origin::Source("fixture".into())),
+        Seed::new(canonicalize(&server.url("/alpha")).unwrap(), Origin::Seed),
+        Seed::new(canonicalize(&server.url("/d1")).unwrap(), Origin::Source("fixture".into())),
     ];
     let cfg = CrawlConfig { max_depth: 0, ..test_config() };
     let outcome = crawl_from(&client, seeds, &cfg).await.unwrap();
@@ -768,10 +906,10 @@ async fn crawl_from_merges_seeds_into_one_budget_and_keeps_provenance() {
 async fn a_seed_repeated_across_sources_is_fetched_once() {
     let server = fixture().await;
     let seeds = vec![
-        (canonicalize(&server.url("/alpha")).unwrap(), Origin::Seed),
+        Seed::new(canonicalize(&server.url("/alpha")).unwrap(), Origin::Seed),
         // Same page, tracking param and fragment differ.
-        (canonicalize(&server.url("/alpha?utm_source=x")).unwrap(), Origin::Source("a".into())),
-        (canonicalize(&server.url("/alpha#top")).unwrap(), Origin::Source("b".into())),
+        Seed::new(canonicalize(&server.url("/alpha?utm_source=x")).unwrap(), Origin::Source("a".into())),
+        Seed::new(canonicalize(&server.url("/alpha#top")).unwrap(), Origin::Source("b".into())),
     ];
     let cfg = CrawlConfig { max_depth: 0, ..test_config() };
     let outcome = crawl_from(&test_client(), seeds, &cfg).await.unwrap();
@@ -817,8 +955,8 @@ async fn same_domain_only_admits_every_seeded_host() {
     // pages would be discarded as off-domain.
     let client = client_resolving("crawler.test", server.addr);
     let seeds = vec![
-        (canonicalize(&server.url("/")).unwrap(), Origin::Seed),
-        (canonicalize(&format!("{}/d1", server.aliased("crawler.test"))).unwrap(), Origin::Seed),
+        Seed::new(canonicalize(&server.url("/")).unwrap(), Origin::Seed),
+        Seed::new(canonicalize(&format!("{}/d1", server.aliased("crawler.test"))).unwrap(), Origin::Seed),
     ];
 
     let cfg = CrawlConfig { max_depth: 1, same_domain_only: true, ..test_config() };
@@ -963,4 +1101,671 @@ async fn a_blocked_destination_fails_before_any_request_is_made() {
     // The guard is a pure check on the URL, so it holds whether or not anything
     // is listening at the other end.
     assert!(strict.check_url(&url).is_err());
+}
+
+
+// *** discovery ***
+
+/// A source that answers from memory, to test the federation itself rather
+/// than any backend. Written outside the module that defines the trait, which
+/// is the claim the trait is making: adding a source is one file.
+#[derive(Debug)]
+struct Canned {
+    name: &'static str,
+    leads: Vec<(&'static str, f32)>,
+    fails: bool,
+    delay: Duration,
+}
+
+impl Canned {
+    fn new(name: &'static str, leads: Vec<(&'static str, f32)>) -> Self {
+        Self { name, leads, fails: false, delay: Duration::ZERO }
+    }
+}
+
+#[async_trait::async_trait]
+impl DiscoverySource for Canned {
+    fn name(&self) -> Arc<str> {
+        Arc::from(self.name)
+    }
+
+    async fn discover(
+        &self,
+        _client: &reqwest::Client,
+        _query: &Query,
+        _budget: &DiscoveryBudget,
+    ) -> Result<Found, CrawlError> {
+        tokio::time::sleep(self.delay).await;
+        if self.fails {
+            return Err(CrawlError::Transport("backend is down".into()));
+        }
+        Ok(Found::leads(self
+            .leads
+            .iter()
+            .map(|(url, score)| Lead {
+                url: canonicalize(url).unwrap(),
+                score: *score,
+                title: None,
+                seen: None,
+                domain: None,
+                language: None,
+                sources: vec![Arc::from(self.name)],
+            })
+            .collect()))
+    }
+}
+
+fn test_query() -> Query {
+    Query { text: "state visit".into(), since: None, until: None, sites: Vec::new() }
+}
+
+#[tokio::test]
+async fn gdelt_scores_by_rank_and_keeps_what_it_was_told() {
+    let server = fixture().await;
+    let gdelt = Gdelt::at(&server.url("/gdelt")).unwrap();
+    let leads = gdelt
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap()
+        .leads;
+
+    assert_eq!(leads.len(), 3);
+    // GDELT reports no relevance number, so its own ordering is the signal.
+    assert!(leads[0].score > leads[1].score && leads[1].score > leads[2].score);
+    assert_eq!(leads[0].score, 1.0);
+
+    assert_eq!(leads[1].title.as_deref(), Some("Second report"));
+    assert_eq!(leads[1].language.as_deref(), Some("Spanish"));
+    assert_eq!(leads[1].domain.as_deref(), Some("example.org"));
+    assert_eq!(leads[1].seen.as_deref(), Some("20260826T101500Z"));
+    // Canonicalized on the way in, like every other URL in the crawler.
+    assert_eq!(leads[2].url.as_str(), "https://example.org/third");
+}
+
+#[tokio::test]
+async fn gdelt_sends_the_query_it_was_given() {
+    let server = fixture().await;
+    let gdelt = Gdelt::at(&server.url("/gdelt")).unwrap();
+    let query = Query {
+        text: "\"state visit\"".into(),
+        since: Some("20260101".into()),
+        until: Some("20260201".into()),
+        sites: Vec::new(),
+    };
+    let budget = DiscoveryBudget { max_candidates: 10, ..DiscoveryBudget::default() };
+    gdelt.discover(&test_client(), &query, &budget).await.unwrap();
+
+    let sent = server.sent();
+    assert!(sent.contains("query=%22state+visit%22"), "got {sent}");
+    assert!(sent.contains("format=json") && sent.contains("mode=artlist"), "got {sent}");
+    assert!(sent.contains("maxrecords=10"), "got {sent}");
+    // A date becomes a whole timestamp, which is all GDELT accepts.
+    assert!(sent.contains("startdatetime=20260101000000"), "got {sent}");
+    assert!(sent.contains("enddatetime=20260201235959"), "got {sent}");
+}
+
+#[tokio::test]
+async fn gdelt_reads_a_missing_articles_key_as_no_results() {
+    let server = fixture().await;
+    let gdelt = Gdelt::at(&server.url("/gdelt-empty")).unwrap();
+    let leads = gdelt
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap()
+        .leads;
+    // `{}` means nothing matched. Reporting that as a failure would turn every
+    // empty search into an error.
+    assert!(leads.is_empty());
+}
+
+#[tokio::test]
+async fn gdelt_recognises_a_rate_limit_answered_as_success() {
+    let server = fixture().await;
+    let gdelt = Gdelt::at(&server.url("/gdelt-limited")).unwrap();
+    let err = gdelt
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap_err();
+
+    // 200 OK carrying a sentence of prose. Parsed blindly it reads as malformed
+    // JSON, which would send the caller looking for the wrong problem.
+    assert!(matches!(err, CrawlError::RateLimited(_)), "got {err}");
+}
+
+#[tokio::test]
+async fn gdelt_refuses_an_empty_query() {
+    let server = fixture().await;
+    let gdelt = Gdelt::at(&server.url("/gdelt")).unwrap();
+    let query = Query { text: "   ".into(), since: None, until: None, sites: Vec::new() };
+    assert!(gdelt.discover(&test_client(), &query, &DiscoveryBudget::default()).await.is_err());
+    assert_eq!(server.hits("/gdelt"), 0, "an empty query should cost no request");
+}
+
+#[tokio::test]
+async fn federate_merges_one_url_found_by_two_sources() {
+    let sources: Vec<Box<dyn DiscoverySource>> = vec![
+        Box::new(Canned::new("alpha", vec![("https://example.org/shared", 0.4)])),
+        Box::new(Canned::new(
+            "beta",
+            vec![("https://example.org/shared?utm_source=x", 0.9), ("https://example.org/only", 0.5)],
+        )),
+    ];
+    let outcome = federate(&test_client(), &sources, &test_query(), &DiscoveryBudget::default()).await;
+
+    assert_eq!(outcome.leads.len(), 2, "got {:?}", outcome.leads);
+    let shared = &outcome.leads[0];
+    assert_eq!(shared.url.as_str(), "https://example.org/shared");
+    // Best score wins; agreement is recorded rather than added to the score.
+    assert_eq!(shared.score, 0.9);
+    assert_eq!(shared.sources.len(), 2);
+    assert!(shared.sources.iter().any(|s| &**s == "alpha"));
+    assert!(shared.sources.iter().any(|s| &**s == "beta"));
+}
+
+#[tokio::test]
+async fn federate_keeps_going_when_a_source_fails_or_hangs() {
+    let mut broken = Canned::new("broken", vec![]);
+    broken.fails = true;
+    let mut slow = Canned::new("slow", vec![("https://example.org/late", 1.0)]);
+    slow.delay = Duration::from_secs(30);
+
+    let sources: Vec<Box<dyn DiscoverySource>> = vec![
+        Box::new(broken),
+        Box::new(slow),
+        Box::new(Canned::new("working", vec![("https://example.org/found", 0.7)])),
+    ];
+    let budget = DiscoveryBudget { deadline: Duration::from_millis(80), ..Default::default() };
+    let outcome = federate(&test_client(), &sources, &test_query(), &budget).await;
+
+    // One backend down and one hanging must not cost the results of the third.
+    assert_eq!(outcome.leads.len(), 1);
+    assert_eq!(outcome.leads[0].url.as_str(), "https://example.org/found");
+    assert_eq!(outcome.failures.len(), 2);
+    assert!(outcome.failures.iter().any(|(name, why)| name == "slow" && why.contains("timed out")));
+    assert!(outcome.failures.iter().any(|(name, _)| name == "broken"));
+}
+
+#[tokio::test]
+async fn federate_cuts_to_the_candidate_budget_keeping_the_best() {
+    let sources: Vec<Box<dyn DiscoverySource>> = vec![Box::new(Canned::new(
+        "alpha",
+        vec![
+            ("https://example.org/low", 0.1),
+            ("https://example.org/high", 0.9),
+            ("https://example.org/mid", 0.5),
+        ],
+    ))];
+    let budget = DiscoveryBudget { max_candidates: 2, ..Default::default() };
+    let outcome = federate(&test_client(), &sources, &test_query(), &budget).await;
+
+    let urls: Vec<&str> = outcome.leads.iter().map(|l| l.url.as_str()).collect();
+    assert_eq!(urls, ["https://example.org/high", "https://example.org/mid"]);
+}
+
+#[tokio::test]
+async fn one_source_cannot_swallow_the_candidate_budget() {
+    // A source that returns many leads at one score, against one that returns
+    // few. This is Wikidata's sixty-one language editions versus an archive
+    // index, which live testing showed crowding the archive out entirely.
+    let many: Vec<(&'static str, f32)> = vec![
+        ("https://example.org/a", 0.7),
+        ("https://example.org/b", 0.7),
+        ("https://example.org/c", 0.7),
+        ("https://example.org/d", 0.7),
+        ("https://example.org/e", 0.7),
+    ];
+    let sources: Vec<Box<dyn DiscoverySource>> = vec![
+        Box::new(Canned::new("flood", many)),
+        Box::new(Canned::new("archive", vec![("https://archive.test/one", 0.5)])),
+    ];
+    let budget = DiscoveryBudget { max_candidates: 4, ..Default::default() };
+    let outcome = federate(&test_client(), &sources, &test_query(), &budget).await;
+
+    assert_eq!(outcome.leads.len(), 4);
+    let from_archive = outcome
+        .leads
+        .iter()
+        .filter(|l| l.sources.iter().any(|s| &**s == "archive"))
+        .count();
+    // Lower-scoring but from the only other source: it must survive the cut.
+    assert_eq!(from_archive, 1, "got {:?}", outcome.leads.iter().map(|l| l.url.as_str()).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_lead_becomes_a_seed_that_remembers_its_source() {
+    let sources: Vec<Box<dyn DiscoverySource>> =
+        vec![Box::new(Canned::new("alpha", vec![("https://example.org/one", 0.6)]))];
+    let outcome = federate(&test_client(), &sources, &test_query(), &DiscoveryBudget::default()).await;
+
+    let seeds = outcome.seeds();
+    assert_eq!(seeds[0].score, 0.6);
+    assert_eq!(seeds[0].origin, Origin::Source("alpha".into()));
+}
+
+#[tokio::test]
+async fn discovered_seeds_are_fetched_best_first() {
+    let server = fixture().await;
+    // Deliberately queued worst-first; only the score should decide.
+    let seeds = vec![
+        Seed::scored(canonicalize(&server.url("/d3")).unwrap(), Origin::Source("s".into()), 0.1),
+        Seed::scored(canonicalize(&server.url("/alpha")).unwrap(), Origin::Source("s".into()), 0.9),
+        Seed::scored(canonicalize(&server.url("/d1")).unwrap(), Origin::Source("s".into()), 0.5),
+    ];
+    // One worker and a budget of two, so the order is the whole result.
+    let cfg = CrawlConfig { max_pages: 2, max_concurrency: 1, max_depth: 0, ..test_config() };
+    let outcome = crawl_from(&test_client(), seeds, &cfg).await.unwrap();
+
+    let urls = outcome.urls();
+    assert!(urls.iter().any(|u| u.ends_with("/alpha")), "got {urls:?}");
+    assert!(urls.iter().any(|u| u.ends_with("/d1")), "got {urls:?}");
+    assert!(!urls.iter().any(|u| u.ends_with("/d3")), "lowest score should have been dropped");
+}
+
+
+// *** wikidata ***
+
+#[tokio::test]
+async fn wikidata_returns_the_official_site_and_every_language_edition() {
+    let server = fixture().await;
+    let wd = Wikidata::at(&server.url("/wd")).unwrap();
+    let found = wd
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap();
+    let leads = found.leads;
+
+    let urls: Vec<&str> = leads.iter().map(|l| l.url.as_str()).collect();
+    // The primary source outranks anything written about it.
+    assert_eq!(urls[0], "https://president.kg/");
+    assert_eq!(leads[0].score, 1.0);
+
+    // Every language edition, which is the part a keyword search will not give.
+    assert!(urls.contains(&"https://en.wikipedia.org/wiki/Sadyr_Japarov"), "got {urls:?}");
+    assert!(urls.contains(&"https://ky.wikipedia.org/wiki/Sadyr"), "got {urls:?}");
+    let ky = leads.iter().find(|l| l.url.as_str().contains("ky.wikipedia")).unwrap();
+    assert_eq!(ky.language.as_deref(), Some("ky"));
+
+    // commonswiki is not a language edition and must not be labelled as one,
+    // nor outrank real articles by sorting earlier than them.
+    let commons = leads.iter().find(|l| l.url.as_str().contains("commons")).unwrap();
+    assert_eq!(commons.language, None);
+    let english = leads.iter().find(|l| l.url.as_str().contains("en.wikipedia")).unwrap();
+    assert!(english.score > ky.score && ky.score > commons.score);
+
+    // Resolve, then read: two calls, not one and not three.
+    assert_eq!(server.hits("/wd"), 2);
+}
+
+#[tokio::test]
+async fn wikidata_treats_an_unknown_name_as_no_results() {
+    let server = fixture().await;
+    let wd = Wikidata::at(&server.url("/wd-search-empty")).unwrap();
+    let leads = wd
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap()
+        .leads;
+    assert!(leads.is_empty());
+    // One request, not two: there was no entity to look up.
+    assert_eq!(server.hits("/wd-search-empty"), 1);
+}
+
+#[tokio::test]
+async fn wikidata_needs_two_requests_and_says_so_by_doing_nothing() {
+    let server = fixture().await;
+    let wd = Wikidata::at(&server.url("/wd-search")).unwrap();
+    let budget = DiscoveryBudget { max_requests: 1, ..DiscoveryBudget::default() };
+    assert!(wd.discover(&test_client(), &test_query(), &budget).await.unwrap().leads.is_empty());
+    assert_eq!(server.hits("/wd-search"), 0, "a budget it cannot meet should cost nothing");
+}
+
+// *** wayback ***
+
+#[tokio::test]
+async fn wayback_turns_captures_into_replay_urls() {
+    let server = fixture().await;
+    let wayback = Wayback::at(&server.url("/cdx")).unwrap();
+    let query = Query { sites: vec!["mfa.gov.kg".into()], ..test_query() };
+    let leads = wayback
+        .discover(&test_client(), &query, &DiscoveryBudget::default())
+        .await
+        .unwrap()
+        .leads;
+
+    assert_eq!(leads.len(), 2, "the header row is not a result");
+    assert_eq!(
+        leads[0].url.as_str(),
+        "https://web.archive.org/web/20190104061944/http://mfa.gov.kg/news/1"
+    );
+    // The original is what stopped resolving; it is kept as the label.
+    assert_eq!(leads[0].title.as_deref(), Some("http://mfa.gov.kg/news/1"));
+    assert_eq!(leads[0].seen.as_deref(), Some("20190104061944"));
+    assert_eq!(leads[0].domain.as_deref(), Some("mfa.gov.kg"));
+}
+
+#[tokio::test]
+async fn wayback_asks_only_for_html_captures_that_worked() {
+    let server = fixture().await;
+    let wayback = Wayback::at(&server.url("/cdx")).unwrap();
+    let query = Query {
+        sites: vec!["mfa.gov.kg".into()],
+        since: Some("20190101".into()),
+        until: Some("20211231".into()),
+        ..test_query()
+    };
+    wayback.discover(&test_client(), &query, &DiscoveryBudget::default()).await.unwrap();
+
+    let sent = server.sent();
+    assert!(sent.contains("url=mfa.gov.kg*"), "got {sent}");
+    assert!(sent.contains("collapse=urlkey"), "got {sent}");
+    assert!(sent.contains("filter=statuscode%3A200"), "got {sent}");
+    assert!(sent.contains("filter=mimetype%3Atext%2Fhtml"), "got {sent}");
+    assert!(sent.contains("from=20190101") && sent.contains("to=20211231"), "got {sent}");
+}
+
+#[tokio::test]
+async fn wayback_has_nothing_to_say_about_a_text_only_query() {
+    let server = fixture().await;
+    let wayback = Wayback::at(&server.url("/cdx")).unwrap();
+    // No site named, so nothing to expand. That is an empty answer, not an
+    // error — the round should not report a failure for it.
+    let leads = wayback
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap()
+        .leads;
+    assert!(leads.is_empty());
+    assert_eq!(server.hits("/cdx"), 0);
+}
+
+#[tokio::test]
+async fn wayback_survives_an_empty_index() {
+    let server = fixture().await;
+    let wayback = Wayback::at(&server.url("/cdx-empty")).unwrap();
+    let query = Query { sites: vec!["mfa.gov.kg".into()], ..test_query() };
+    let leads = wayback
+        .discover(&test_client(), &query, &DiscoveryBudget::default())
+        .await
+        .unwrap()
+        .leads;
+    assert!(leads.is_empty());
+}
+
+// *** brave ***
+
+#[tokio::test]
+async fn brave_sends_its_key_as_a_header_and_ranks_by_position() {
+    let server = fixture().await;
+    let brave = Brave::at(&server.url("/brave"), "s3cret").unwrap();
+    let leads = brave
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap()
+        .leads;
+
+    assert_eq!(leads.len(), 2);
+    assert_eq!(leads[0].score, 1.0);
+    assert!(leads[0].score > leads[1].score);
+    assert_eq!(leads[0].seen.as_deref(), Some("2 days ago"));
+    assert_eq!(leads[0].domain.as_deref(), Some("example.org"));
+
+    // The credential travels in a header, never in the query string, and never
+    // through a tool schema.
+    let sent = server.sent();
+    assert!(sent.contains("x-subscription-token: s3cret"), "got {sent}");
+    assert!(!sent.contains("q=state+visit&key"), "the key must not be a query parameter");
+}
+
+#[test]
+fn brave_is_absent_rather_than_broken_without_a_key() {
+    // Safe to assert unconditionally: the suite does not set the variable, and
+    // a source that fails identically on every call is worse than no source.
+    unsafe { std::env::remove_var(crate::sources::brave::API_KEY_ENV) };
+    assert!(Brave::from_env().is_none());
+}
+
+
+// *** link scoring ***
+
+fn subject() -> Terms {
+    // The same person, as three different outlets would write the name.
+    Terms::new(["Sadyr Japarov", "Sadyr Zhaparov", "Садыр Жапаров"])
+}
+
+fn link(url: &str, anchor: &str) -> LinkContext {
+    LinkContext {
+        url: canonicalize(url).unwrap(),
+        anchor: anchor.to_string(),
+        nearby: String::new(),
+        rel_next: false,
+    }
+}
+
+#[test]
+fn a_name_matches_across_scripts_and_spellings() {
+    let terms = subject();
+    // Each spelling finds the subject, which is the entire point of carrying
+    // the alias set: outlets do not agree on romanisation.
+    assert_eq!(terms.match_strength("Sadyr Japarov arrived"), 1.0);
+    assert_eq!(terms.match_strength("SADYR ZHAPAROV ARRIVED"), 1.0);
+    assert_eq!(terms.match_strength("Садыр Жапаров прибыл"), 1.0);
+    // A surname alone is partial credit, not nothing.
+    let partial = terms.match_strength("Japarov met the delegation");
+    assert!(partial > 0.0 && partial < 1.0, "got {partial}");
+    assert_eq!(terms.match_strength("the cabinet met today"), 0.0);
+}
+
+#[test]
+fn accents_fold_so_one_romanisation_finds_another() {
+    let terms = Terms::new(["Sadir Japarov"]);
+    // Azerbaijani writes it Sadır; Czech, Žaparov. Folding is what lets one
+    // spelling in the query match another in the anchor text.
+    assert_eq!(terms.match_strength("Sadır Japarov"), 1.0);
+    assert_eq!(Terms::new(["Zaparov"]).match_strength("Žaparov"), 1.0);
+}
+
+#[test]
+fn url_shape_tells_an_archive_from_a_dead_end() {
+    let shape = |u: &str| Shape::of(&canonicalize(u).unwrap());
+
+    assert!(shape("https://x.test/press-releases/2019/").archive);
+    assert!(shape("https://x.test/press-releases/2019/").dated);
+    assert!(shape("https://x.test/news?page=47").paginated);
+    assert!(shape("https://x.test/news/page/47").paginated);
+    assert!(shape("https://x.test/cookie-policy").dead_end);
+    assert!(shape("https://x.test/assets/app.js").asset);
+
+    // A bare article path is none of these, and that is fine.
+    let plain = shape("https://x.test/some/page");
+    assert!(!plain.archive && !plain.paginated && !plain.dead_end);
+}
+
+#[test]
+fn the_archive_outranks_the_cookie_notice() {
+    let terms = subject();
+    let archive = score_link(&link("https://x.test/press-releases/2019/", "Press releases"), &terms, 0.0).unwrap();
+    let cookies = score_link(&link("https://x.test/cookie-policy", "Cookie policy"), &terms, 0.0).unwrap();
+    let plain = score_link(&link("https://x.test/about", "About"), &terms, 0.0).unwrap();
+
+    // This is the whole behaviour in one assertion: given a budget, the crawl
+    // spends it on the archive rather than the cookie notice.
+    assert!(archive > plain, "archive {archive} vs plain {plain}");
+    assert!(plain > cookies, "plain {plain} vs cookies {cookies}");
+    assert!(archive >= ON_TOPIC);
+    assert!(cookies < ON_TOPIC);
+}
+
+#[test]
+fn a_link_named_in_the_subjects_own_language_scores() {
+    let terms = subject();
+    // Before aliases reached the scorer this was zero, and the Kyrgyz and
+    // Russian coverage — most of what exists — was invisible.
+    let cyrillic = score_link(&link("https://x.test/n/1", "Садыр Жапаров встретился"), &terms, 0.0).unwrap();
+    assert!(cyrillic >= ON_TOPIC, "got {cyrillic}");
+}
+
+#[test]
+fn pagination_is_followed_because_nothing_else_indexes_it() {
+    let terms = Terms::default();
+    let mut next = link("https://x.test/news", "Next");
+    next.rel_next = true;
+
+    // Page 47 of an archive is not in any search index. Both the query form
+    // and the rel attribute have to be enough on their own, since an unfocused
+    // crawl has no subject to match against.
+    assert!(score_link(&link("https://x.test/news?page=47", "47"), &terms, 0.0).unwrap() >= ON_TOPIC);
+    assert!(score_link(&next, &terms, 0.0).unwrap() >= ON_TOPIC);
+}
+
+#[test]
+fn assets_are_never_worth_a_request() {
+    // Not a low score — not a page at all, however well its URL matches.
+    assert_eq!(score_link(&link("https://x.test/app.js", "Sadyr Japarov"), &subject(), 1.0), None);
+}
+
+#[test]
+fn a_relevant_parent_lifts_its_links() {
+    let terms = subject();
+    let anonymous = link("https://x.test/n/1", "Read more");
+    let from_nowhere = score_link(&anonymous, &terms, 0.0).unwrap();
+    let from_a_good_page = score_link(&anonymous, &terms, 1.0).unwrap();
+
+    // How a crawl stays on a thread instead of leaving it at the first hop.
+    assert!(from_a_good_page > from_nowhere);
+}
+
+// *** focused crawling ***
+
+#[tokio::test]
+async fn a_focused_crawl_spends_its_budget_on_the_archive() {
+    let server = fixture().await;
+    let cfg = CrawlConfig {
+        max_pages: 3,
+        max_concurrency: 1,
+        max_depth: 2,
+        focus: Some(Terms::new(["Japarov"])),
+        ..test_config()
+    };
+    let outcome = crawl(&test_client(), &server.url("/hub"), &cfg).await.unwrap();
+
+    let urls = outcome.urls();
+    // The press archive is listed last on the page and fetched first anyway.
+    assert!(urls.iter().any(|u| u.ends_with("/press/2019/")), "got {urls:?}");
+    assert!(!urls.iter().any(|u| u.contains("cookie-policy")), "got {urls:?}");
+    assert_eq!(server.hits("/cookie-policy"), 0, "a dead end should cost nothing");
+}
+
+#[tokio::test]
+async fn a_focused_crawl_follows_the_next_page() {
+    let server = fixture().await;
+    let cfg = CrawlConfig {
+        max_pages: 10,
+        max_depth: 2,
+        focus: Some(Terms::new(["Japarov"])),
+        ..test_config()
+    };
+    let outcome = crawl(&test_client(), &server.url("/hub"), &cfg).await.unwrap();
+
+    // Page two exists only behind a rel="next" link. No index lists it.
+    assert!(outcome.urls().iter().any(|u| u.ends_with("/press/2019/page/2")), "got {:?}", outcome.urls());
+}
+
+#[tokio::test]
+async fn tunnelling_reaches_what_sits_behind_a_dull_page() {
+    let server = fixture().await;
+    let focus = Terms::new(["Садыр Жапаров"]);
+
+    // "Read more" on a page that names nothing: the link scores below the
+    // threshold, and the page it leads to is the one that matters.
+    let cfg = CrawlConfig {
+        max_pages: 10,
+        max_depth: 2,
+        focus: Some(focus.clone()),
+        tunnel_slack: 2,
+        ..test_config()
+    };
+    let reached = crawl(&test_client(), &server.url("/dull"), &cfg).await.unwrap();
+    assert!(reached.urls().iter().any(|u| u.ends_with("/q/target")), "got {:?}", reached.urls());
+
+    // With no allowance the same crawl prunes at the first dull hop, which is
+    // exactly the failure tunnelling exists to prevent.
+    let strict = CrawlConfig { tunnel_slack: 0, ..cfg };
+    let pruned = crawl(&test_client(), &server.url("/dull"), &strict).await.unwrap();
+    assert!(!pruned.urls().iter().any(|u| u.ends_with("/q/target")), "got {:?}", pruned.urls());
+}
+
+#[tokio::test]
+async fn relevance_is_measured_from_the_page_that_arrived() {
+    let server = fixture().await;
+    let cfg = CrawlConfig {
+        max_pages: 5,
+        max_depth: 1,
+        focus: Some(Terms::new(["Japarov"])),
+        ..test_config()
+    };
+    let outcome = crawl(&test_client(), &server.url("/hub"), &cfg).await.unwrap();
+
+    let press = outcome.pages.iter().find(|p| p.url.as_str().ends_with("/press/2019/")).unwrap();
+    let hub = outcome.pages.iter().find(|p| p.url.as_str().ends_with("/hub")).unwrap();
+    // The hub's link text promised the archive; its own body says nothing.
+    assert!(press.relevance > hub.relevance, "press {} hub {}", press.relevance, hub.relevance);
+}
+
+#[tokio::test]
+async fn an_unfocused_crawl_is_still_breadth_first() {
+    let server = fixture().await;
+    // No subject, so every link scores equally and insertion order decides.
+    // The heap must not reorder what the old queue would have kept.
+    let cfg = CrawlConfig { max_pages: 2, max_concurrency: 1, max_depth: 2, ..test_config() };
+    let outcome = crawl(&test_client(), &server.url("/d1"), &cfg).await.unwrap();
+
+    let urls = outcome.urls();
+    assert!(urls[0].ends_with("/d1"), "got {urls:?}");
+    assert!(urls[1].ends_with("/d2"), "got {urls:?}");
+}
+
+
+// *** unicode safety ***
+//
+// Every string here comes off the web, and the web is not ASCII. Both of these
+// panicked the worker thread before they were fixed — one on an anchor long
+// enough to truncate, one on a search offset taken from folded text.
+
+#[tokio::test]
+async fn a_non_latin_page_does_not_panic_the_crawl() {
+    let server = fixture().await;
+    let cfg = CrawlConfig {
+        max_depth: 1,
+        focus: Some(Terms::new(["Садыр Жапаров"])),
+        ..test_config()
+    };
+    let outcome = crawl(&test_client(), &server.url("/cyrillic"), &cfg).await.unwrap();
+
+    // The anchor is far past the truncation limit and made of multi-byte
+    // characters, so cutting it on a byte index lands mid-character.
+    assert!(outcome.urls().iter().any(|u| u.ends_with("/q/target")), "got {:?}", outcome.urls());
+}
+
+#[tokio::test]
+async fn search_quotes_the_original_text_not_the_folded_one() {
+    let server = fixture().await;
+    let cfg = CrawlConfig { max_depth: 0, ..test_config() };
+    let (matches, _) =
+        search_site(&test_client(), &server.url("/cyrillic"), "ZIYARET", &cfg).await.unwrap();
+
+    let snippet = &matches.first().expect("the page contains the term").snippet;
+    // `İ` lowercases to two characters, so every offset after it shifts. Taken
+    // from the folded string and applied to the original, the quote lands in
+    // the wrong place — or between the bytes of a character.
+    assert!(snippet.contains("ziyareti"), "got {snippet}");
+    assert!(snippet.contains("İstanbul"), "got {snippet}");
+}
+
+#[tokio::test]
+async fn an_empty_search_term_is_refused() {
+    let server = fixture().await;
+    let cfg = CrawlConfig { max_depth: 0, ..test_config() };
+    // Otherwise it matches between every pair of characters and reports a hit
+    // count one larger than the page length.
+    assert!(search_site(&test_client(), &server.url("/"), "   ", &cfg).await.is_err());
 }

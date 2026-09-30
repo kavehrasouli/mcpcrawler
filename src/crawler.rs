@@ -2,8 +2,10 @@ use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
 use futures::future::join_all;
 use reqwest::Client;
+use crate::scoring::{LinkContext, ON_TOPIC, Terms, score_link};
 use scraper::{Html, Node, Selector};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -38,6 +40,11 @@ const SKIP_TAGS: &[&str] = &[
     "nav", "header", "footer", "aside", "form", "button", "select",
 ];
 
+/// How much anchor text and surrounding text to keep for scoring. Both are
+/// signals, not content — a whole paragraph adds noise, not precision.
+const ANCHOR_CHARS: usize = 200;
+const NEARBY_CHARS: usize = 400;
+
 /// Tags that should produce a line break when flattening to text.
 const BLOCK_TAGS: &[&str] = &[
     "p", "div", "section", "article", "li", "tr", "br", "hr",
@@ -58,6 +65,7 @@ pub enum CrawlError {
     Parse(String),
     Blocked(String),
     Json(String),
+    RateLimited(String),
 }
 
 impl fmt::Display for CrawlError {
@@ -73,6 +81,7 @@ impl fmt::Display for CrawlError {
             CrawlError::Parse(e) => write!(f, "could not parse XML: {e}"),
             CrawlError::Blocked(why) => write!(f, "destination refused: {why}"),
             CrawlError::Json(e) => write!(f, "response was not the expected JSON: {e}"),
+            CrawlError::RateLimited(who) => write!(f, "rate limited: {who}"),
         }
     }
 }
@@ -115,6 +124,18 @@ pub struct CrawlConfig {
     /// found in the seed page. Necessary for client-rendered sites, whose HTML
     /// contains no links at all.
     pub seed_from_sitemap: bool,
+    /// What the crawl is looking for. With `None` the frontier stays
+    /// breadth-first and every link is equal, which is the right behaviour for
+    /// "fetch this site" and the wrong one for "find what this site says about
+    /// X".
+    pub focus: Option<Terms>,
+    /// Consecutive off-topic hops a branch may take before it is pruned.
+    ///
+    /// Zero would be pure focused crawling, and it is a trap: the page you want
+    /// is routinely two hops behind an index page that says nothing itself, so
+    /// pruning on the first bad score cuts exactly the paths that lead to
+    /// archives. This is the tunnelling allowance.
+    pub tunnel_slack: u32,
 }
 
 impl Default for CrawlConfig {
@@ -128,6 +149,8 @@ impl Default for CrawlConfig {
             same_domain_only: false,
             max_body_bytes: 5 * 1024 * 1024,
             seed_from_sitemap: false,
+            focus: None,
+            tunnel_slack: 2,
         }
     }
 }
@@ -544,6 +567,9 @@ pub struct FetchedPage {
     pub html: String,
     /// How this URL entered the frontier.
     pub origin: Origin,
+    /// How much of the subject the fetched page turned out to contain, 0 to 1.
+    /// Zero for an unfocused crawl, which has no subject to measure against.
+    pub relevance: f32,
 }
 
 /// Where a candidate URL came from.
@@ -588,13 +614,72 @@ impl fmt::Display for Origin {
     }
 }
 
+/// A URL entering the frontier from outside the crawl.
+#[derive(Debug, Clone)]
+pub struct Seed {
+    pub url: Url,
+    pub origin: Origin,
+    /// How promising the caller thinks this URL is; higher is better.
+    ///
+    /// The frontier is still FIFO, so today this only decides the order seeds
+    /// are queued in — which is already worth having, because it means a
+    /// federated round fetches its best candidates before it runs out of
+    /// budget. Phase 4 replaces the queue with a priority queue and this
+    /// becomes the ordering key for followed links as well.
+    pub score: f32,
+}
+
+impl Seed {
+    /// A seed nobody has scored. Ordering among these is the order given.
+    pub fn new(url: Url, origin: Origin) -> Self {
+        Self { url, origin, score: 0.0 }
+    }
+
+    pub fn scored(url: Url, origin: Origin, score: f32) -> Self {
+        Self { url, origin, score }
+    }
+}
+
 /// A URL waiting to be fetched, with everything the crawl knows about it.
 #[derive(Debug, Clone)]
 struct Candidate {
     url: Url,
     depth: u32,
     origin: Origin,
+    /// How promising this URL looked before it was fetched.
+    score: f32,
+    /// Remaining tunnelling allowance — consecutive off-topic hops this branch
+    /// may still take. Spent down on a poor link, restored by a good one.
+    slack: u32,
+    /// Insertion order, used only to break ties. With no focus every score is
+    /// equal, so this alone decides the order and the crawl is plain
+    /// breadth-first, exactly as it was before the queue became a heap.
+    seq: usize,
 }
+
+// Ordering is what makes the frontier a priority queue: `BinaryHeap` pops the
+// greatest, so "greatest" must mean "most worth fetching next".
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CmpOrdering::Equal
+    }
+}
+
+impl Eq for Candidate {}
 
 #[derive(Debug, Default)]
 pub struct CrawlOutcome {
@@ -623,7 +708,7 @@ impl CrawlOutcome {
 }
 
 struct CrawlState {
-    frontier: Mutex<VecDeque<Candidate>>,
+    frontier: Mutex<BinaryHeap<Candidate>>,
     seen: Mutex<HashSet<String>>,
     pages: Mutex<Vec<FetchedPage>>,
     failed: Mutex<Vec<(String, String)>>,
@@ -631,6 +716,9 @@ struct CrawlState {
     robots: Mutex<HashMap<String, Option<Arc<Robot>>>>,
     active: AtomicUsize,
     claimed: AtomicUsize,
+    /// Handed out in order so equally scored candidates keep their arrival
+    /// order.
+    queued: AtomicUsize,
     robots_skipped: AtomicUsize,
     budget_hit: AtomicBool,
     /// Every host the caller seeded. With one seed this is the old `seed_host`;
@@ -690,7 +778,7 @@ async fn robots_for(
 }
 
 async fn process_one(client: &Client, state: &CrawlState, cfg: &CrawlConfig, item: Candidate) {
-    let Candidate { url, depth, origin } = item;
+    let Candidate { url, depth, origin, score, slack, .. } = item;
     if cfg.respect_robots
         && let Some(robot) = robots_for(client, state, &url).await
         && !robot.allowed(url.as_str())
@@ -703,26 +791,42 @@ async fn process_one(client: &Client, state: &CrawlState, cfg: &CrawlConfig, ite
 
     match fetch_page(client, &url, cfg.max_body_bytes).await {
         Ok(html) => {
-            if depth < cfg.max_depth {
-                let mut frontier = state.frontier.lock().unwrap();
-                let mut seen = state.seen.lock().unwrap();
-                for link in extract_links(&html, &url) {
-                    if is_blocked(&link) {
-                        continue;
-                    }
-                    if cfg.same_domain_only && !state.seed_hosts.contains(&host_of(&link)) {
-                        continue;
-                    }
-                    if seen.insert(dedup_key(&link)) {
-                        frontier.push_back(Candidate {
-                            url: link,
-                            depth: depth + 1,
-                            origin: Origin::Link { from: url.clone() },
-                        });
-                    }
+            let relevance = match &cfg.focus {
+                // Measured from the page that actually arrived, not inherited
+                // from how good its link looked. An index page whose link text
+                // promised everything and whose body says nothing should not
+                // lend its promise to its children.
+                Some(terms) if depth < cfg.max_depth => {
+                    let page = analyse(&html, &url);
+                    let relevance = terms.match_strength(&page.text);
+                    queue_links(state, cfg, &url, depth, slack, relevance, page.links, terms);
+                    relevance
                 }
-            }
-            state.pages.lock().unwrap().push(FetchedPage { url, html, origin });
+                Some(terms) => terms.match_strength(&extract_text(&html)),
+                None => {
+                    if depth < cfg.max_depth {
+                        let page = analyse(&html, &url);
+                        queue_links(
+                            state,
+                            cfg,
+                            &url,
+                            depth,
+                            slack,
+                            0.0,
+                            page.links,
+                            &Terms::default(),
+                        );
+                    }
+                    score
+                }
+            };
+
+            state.pages.lock().unwrap().push(FetchedPage {
+                url,
+                html,
+                origin,
+                relevance,
+            });
         }
         Err(e) => {
             // Recorded separately so a failed fetch is never reported as visited.
@@ -735,6 +839,64 @@ async fn process_one(client: &Client, state: &CrawlState, cfg: &CrawlConfig, ite
     }
 }
 
+/// Queue a page's links, deciding for each whether it is worth a request.
+///
+/// A link that looks on-topic restores the branch's full tunnelling allowance.
+/// One that does not spends a unit of it, and when a branch runs out it is
+/// dropped — so the crawl will walk through two dull pages to reach a good one
+/// but will not wander indefinitely.
+#[allow(clippy::too_many_arguments)]
+fn queue_links(
+    state: &CrawlState,
+    cfg: &CrawlConfig,
+    parent: &Url,
+    depth: u32,
+    slack: u32,
+    relevance: f32,
+    links: Vec<LinkContext>,
+    terms: &Terms,
+) {
+    let focused = !terms.is_empty();
+    let mut frontier = state.frontier.lock().unwrap();
+    let mut seen = state.seen.lock().unwrap();
+
+    for link in links {
+        if is_blocked(&link.url) {
+            continue;
+        }
+        if cfg.same_domain_only && !state.seed_hosts.contains(&host_of(&link.url)) {
+            continue;
+        }
+
+        let (score, slack) = if focused {
+            let Some(score) = score_link(&link, terms, relevance) else {
+                continue;
+            };
+            if score >= ON_TOPIC {
+                (score, cfg.tunnel_slack)
+            } else if slack == 0 {
+                // Out of allowance on an unpromising branch: stop here.
+                continue;
+            } else {
+                (score, slack - 1)
+            }
+        } else {
+            (0.0, cfg.tunnel_slack)
+        };
+
+        if seen.insert(dedup_key(&link.url)) {
+            frontier.push(Candidate {
+                url: link.url,
+                depth: depth + 1,
+                origin: Origin::Link { from: parent.clone() },
+                score,
+                slack,
+                seq: state.queued.fetch_add(1, Ordering::SeqCst),
+            });
+        }
+    }
+}
+
 async fn worker(client: &Client, state: &CrawlState, cfg: &CrawlConfig) {
     loop {
         // Popping and marking the work active must happen under one lock, or a
@@ -742,7 +904,7 @@ async fn worker(client: &Client, state: &CrawlState, cfg: &CrawlConfig) {
         // while this item is still in hand.
         let next = {
             let mut frontier = state.frontier.lock().unwrap();
-            match frontier.pop_front() {
+            match frontier.pop() {
                 Some(item) => {
                     state.active.fetch_add(1, Ordering::SeqCst);
                     Some(item)
@@ -785,7 +947,7 @@ pub async fn crawl(
     cfg: &CrawlConfig,
 ) -> Result<CrawlOutcome, CrawlError> {
     let seed_url = canonicalize(seed)?;
-    crawl_from(client, vec![(seed_url, Origin::Seed)], cfg).await
+    crawl_from(client, vec![Seed::new(seed_url, Origin::Seed)], cfg).await
 }
 
 /// Crawl from many seeds at once, each carrying where it came from.
@@ -796,21 +958,34 @@ pub async fn crawl(
 /// crawl per source would multiply every limit by the number of sources.
 pub async fn crawl_from(
     client: &Client,
-    seeds: Vec<(Url, Origin)>,
+    mut seeds: Vec<Seed>,
     cfg: &CrawlConfig,
 ) -> Result<CrawlOutcome, CrawlError> {
     if seeds.is_empty() {
         return Err(CrawlError::BadUrl("no seed URLs".to_string()));
     }
 
-    let mut frontier: VecDeque<Candidate> = VecDeque::new();
+    // Best first, so a budget that runs out takes the tail rather than an
+    // arbitrary slice. `sort_by` is stable, so equal scores keep their order.
+    seeds.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    let mut frontier: BinaryHeap<Candidate> = BinaryHeap::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut seed_hosts: HashSet<String> = HashSet::new();
+    let mut queued = 0usize;
 
-    for (url, origin) in seeds {
-        seed_hosts.insert(host_of(&url));
-        if seen.insert(dedup_key(&url)) {
-            frontier.push_back(Candidate { url, depth: 0, origin });
+    for seed in seeds {
+        seed_hosts.insert(host_of(&seed.url));
+        if seen.insert(dedup_key(&seed.url)) {
+            frontier.push(Candidate {
+                url: seed.url,
+                depth: 0,
+                origin: seed.origin,
+                score: seed.score,
+                slack: cfg.tunnel_slack,
+                seq: queued,
+            });
+            queued += 1;
         }
     }
 
@@ -836,12 +1011,32 @@ pub async fn crawl_from(
                 if cfg.same_domain_only && !seed_hosts.contains(&host_of(&entry.url)) {
                     continue;
                 }
+                // A sitemap lists URLs with no anchor text and no context, so
+                // the URL itself is all there is to judge them on.
+                let score = match &cfg.focus {
+                    Some(terms) => score_link(
+                        &LinkContext {
+                            url: entry.url.clone(),
+                            anchor: String::new(),
+                            nearby: String::new(),
+                            rel_next: false,
+                        },
+                        terms,
+                        0.0,
+                    )
+                    .unwrap_or(0.0),
+                    None => 0.0,
+                };
                 if seen.insert(dedup_key(&entry.url)) {
-                    frontier.push_back(Candidate {
+                    frontier.push(Candidate {
                         url: entry.url,
                         depth: 0,
                         origin: Origin::Sitemap,
+                        score,
+                        slack: cfg.tunnel_slack,
+                        seq: queued,
                     });
+                    queued += 1;
                 }
             }
         }
@@ -858,6 +1053,7 @@ pub async fn crawl_from(
         claimed: AtomicUsize::new(0),
         robots_skipped: AtomicUsize::new(0),
         budget_hit: AtomicBool::new(false),
+        queued: AtomicUsize::new(queued),
         seed_hosts,
     };
 
@@ -874,7 +1070,7 @@ pub async fn crawl_from(
 
 /// One URL per distinct host, so a sitemap is looked up once per site however
 /// many seeds landed on it.
-fn distinct_host_roots(frontier: &VecDeque<Candidate>) -> Vec<Url> {
+fn distinct_host_roots(frontier: &BinaryHeap<Candidate>) -> Vec<Url> {
     let mut seen = HashSet::new();
     frontier
         .iter()
@@ -908,6 +1104,10 @@ pub async fn search_site(
     keyword: &str,
     cfg: &CrawlConfig,
 ) -> Result<(Vec<Match>, CrawlOutcome), CrawlError> {
+    if keyword.trim().is_empty() {
+        return Err(CrawlError::BadUrl("empty search term".to_string()));
+    }
+
     let outcome = crawl(client, seed, cfg).await?;
     let needle = keyword.to_lowercase();
 
@@ -916,16 +1116,22 @@ pub async fn search_site(
         .iter()
         .filter_map(|page| {
             let text = extract_text(&page.html);
-            let haystack = text.to_lowercase();
+            let (haystack, offsets) = lowercase_with_offsets(&text);
             let hits = haystack.matches(&needle).count();
             if hits == 0 {
                 return None;
             }
             let at = haystack.find(&needle)?;
+            // Back to where the match sits in the *original* text. Lowercasing
+            // is not length-preserving — Turkish `İ` becomes two characters —
+            // so an offset taken from the folded string does not address the
+            // string it came from.
+            let start = *offsets.get(at)?;
+            let end = *offsets.get(at + needle.len()).unwrap_or(&text.len());
             Some(Match {
                 url: page.url.clone(),
                 hits,
-                snippet: snippet_around(&text, at, needle.len()),
+                snippet: snippet_around(&text, start, end.saturating_sub(start)),
             })
         })
         .collect();
@@ -933,9 +1139,29 @@ pub async fn search_site(
     Ok((matches, outcome))
 }
 
+/// Lowercase `text`, and for every byte of the result record which byte of the
+/// original it came from. The map is what makes a case-insensitive search
+/// reportable: you can find in the folded text and still quote the real one.
+fn lowercase_with_offsets(text: &str) -> (String, Vec<usize>) {
+    let mut lower = String::with_capacity(text.len());
+    let mut offsets: Vec<usize> = Vec::with_capacity(text.len() + 1);
+
+    for (at, c) in text.char_indices() {
+        for folded in c.to_lowercase() {
+            let before = lower.len();
+            lower.push(folded);
+            offsets.resize(lower.len(), at);
+            debug_assert!(lower.len() > before);
+        }
+    }
+    offsets.push(text.len());
+    (lower, offsets)
+}
+
 fn snippet_around(text: &str, at: usize, len: usize) -> String {
+    let at = floor_boundary(text, at);
     let start = text[..at].char_indices().rev().nth(60).map(|(i, _)| i).unwrap_or(0);
-    let end_from = (at + len).min(text.len());
+    let end_from = floor_boundary(text, (at + len).min(text.len()));
     let end = text[end_from..]
         .char_indices()
         .nth(90)
@@ -964,16 +1190,89 @@ static MAIN_SELECTORS: LazyLock<Vec<Selector>> = LazyLock::new(|| {
 });
 
 pub fn extract_links(html: &str, base: &Url) -> Vec<Url> {
-    let document = Html::parse_document(html);
-    let mut seen = HashSet::new();
-    document
-        .select(&LINK_SELECTOR)
-        .filter_map(|el| el.value().attr("href"))
-        .filter_map(|href| base.join(href).ok())
-        .filter(|url| matches!(url.scheme(), "http" | "https"))
-        .filter_map(|url| canonicalize(url.as_str()).ok())
-        .filter(|url| seen.insert(dedup_key(url)))
+    links_in(&Html::parse_document(html), base)
+        .into_iter()
+        .map(|link| link.url)
         .collect()
+}
+
+/// A page read once: its links with the context needed to score them, and its
+/// main text. Parsing is the expensive part of a fetch, and the frontier needs
+/// both, so doing it twice would double the cost of every page crawled.
+pub struct PageAnalysis {
+    pub links: Vec<LinkContext>,
+    pub text: String,
+}
+
+pub fn analyse(html: &str, base: &Url) -> PageAnalysis {
+    let document = Html::parse_document(html);
+    PageAnalysis { links: links_in(&document, base), text: text_of(&document) }
+}
+
+fn links_in(document: &Html, base: &Url) -> Vec<LinkContext> {
+    let mut seen = HashSet::new();
+    let mut links = Vec::new();
+
+    for el in document.select(&LINK_SELECTOR) {
+        let Some(href) = el.value().attr("href") else { continue };
+        let Ok(joined) = base.join(href) else { continue };
+        if !matches!(joined.scheme(), "http" | "https") {
+            continue;
+        }
+        let Ok(url) = canonicalize(joined.as_str()) else { continue };
+        if !seen.insert(dedup_key(&url)) {
+            continue;
+        }
+
+        // The sentence around a link says more about it than three words of
+        // anchor text, and costs nothing — the parent is already in hand.
+        let nearby = el
+            .parent()
+            .and_then(scraper::ElementRef::wrap)
+            .map(|parent| trimmed_text(parent.text(), NEARBY_CHARS))
+            .unwrap_or_default();
+
+        links.push(LinkContext {
+            url,
+            anchor: trimmed_text(el.text(), ANCHOR_CHARS),
+            nearby,
+            rel_next: el
+                .value()
+                .attr("rel")
+                .is_some_and(|rel| rel.to_ascii_lowercase().split_whitespace().any(|r| r == "next")),
+        });
+    }
+    links
+}
+
+/// The largest char boundary at or below `limit`. Truncating on a raw byte
+/// index panics the moment a page uses anything outside ASCII, which — for a
+/// crawler whose whole point is multilingual coverage — is most of them.
+fn floor_boundary(text: &str, limit: usize) -> usize {
+    let mut cutoff = limit.min(text.len());
+    while cutoff > 0 && !text.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    cutoff
+}
+
+fn trimmed_text<'a>(parts: impl Iterator<Item = &'a str>, limit: usize) -> String {
+    let mut out = String::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+        if out.len() >= limit {
+            out.truncate(floor_boundary(&out, limit));
+            break;
+        }
+    }
+    out
 }
 
 fn collect_text(node: ego_tree::NodeRef<'_, Node>, out: &mut String) {
@@ -1005,8 +1304,10 @@ fn collect_text(node: ego_tree::NodeRef<'_, Node>, out: &mut String) {
 /// whole `<body>` gave every page on a site a large identical block of text,
 /// which would poison both relevance scoring and duplicate detection.
 pub fn extract_text(html: &str) -> String {
-    let document = Html::parse_document(html);
+    text_of(&Html::parse_document(html))
+}
 
+fn text_of(document: &Html) -> String {
     let root = MAIN_SELECTORS
         .iter()
         .find_map(|sel| document.select(sel).next())

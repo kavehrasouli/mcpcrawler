@@ -9,7 +9,9 @@ Link depth is only a guard rail, not the main control.
 
 | Tool | Purpose |
 |---|---|
-| `crawl_site` | Crawl from a URL, return the pages actually fetched |
+| `discover` | Find candidate URLs for a topic with no seed URL, from federated sources |
+| `discover_and_crawl` | Same, then fetch the best candidates in one page budget |
+| `crawl_site` | Crawl from a URL, return the pages actually fetched (`about` to focus it) |
 | `crawl_site_same_domain` | Same, but only follows links on the seed's domain |
 | `fetch_content` | Readable text of one URL (`headless` for JS-rendered pages) |
 | `fetch_content_in_md` | Same, as markdown |
@@ -76,6 +78,80 @@ Crawl tools report fetched and failed URLs **separately** — a URL that 404s or
 a non-HTML body appears under `Failed`, never in the visited list. Each report also ends
 with a `Found via:` line counting where the fetched URLs came from — seed, sitemap, or a
 followed link.
+
+## Discovery
+
+Every other tool takes a `url` as its first argument, which assumes you already know where
+to look. `discover` does not:
+
+```
+discover query="\"state visit\" Kyrgyzstan" since=20260101 until=20260901
+```
+
+It fans the query across discovery sources, merges the answers into one ranked, deduplicated
+list, and reports which source found each URL. A URL two sources found keeps both names —
+corroboration is recorded rather than folded into the score.
+
+| Source | Key needed | Reaches |
+|---|---|---|
+| GDELT DOC 2.0 | no | worldwide news in 100+ languages, including syndicated regional coverage |
+| Wikidata | no | the entity's official website and every language edition of its article |
+| Wayback CDX | no | pages that were deleted and exist nowhere else |
+| Brave Search | `MCPCRAWLER_BRAVE_API_KEY` | general web search — PDFs, transcripts, agendas |
+
+Brave is registered only when its key is present in the server's environment; without it the
+other three run and it is simply absent. The key never appears in a tool schema, so it cannot
+travel through the model's context.
+
+Sources are not the same shape. GDELT and Brave search text. Wayback searches by **site**, not
+by keyword, so it contributes only when `sites` names a host — Wikidata's official-website
+claim is one way to learn one. Wikidata takes a name and returns identity.
+
+The candidate budget is shared out by taking turns between sources rather than by global
+score, because scores are only comparable within a source. Without that, Wikidata's sixty-odd
+language editions swallow a budget of ten whole and the archive results never appear.
+
+`discover_and_crawl` does the same and then fetches, best-scoring first, under one page
+budget. Candidates are fetched at depth 0 — discovery already returns URLs from many hosts,
+so following links from each would multiply the work by a factor nobody asked for.
+
+Adding a source is one file: implement `DiscoverySource` in [src/sources/](src/sources/) and
+add it to the list in `Crawler::new`.
+
+Note that discovery sources talk to documented APIs, so `robots.txt` is not consulted for
+those requests. It still governs every page the crawler fetches from the results.
+
+## Focused crawling
+
+Given a subject, the crawler scores every link *before* opening it, so the page budget goes
+where the answer is likely to be:
+
+```
+crawl_site_same_domain url=https://example.gov about="state visit Kyrgyzstan"
+```
+
+Four signals, all free because the page is already parsed: the anchor text, the sentence
+around the link, the tokens in the URL, and how relevant the page holding the link turned out
+to be. On top of that, URL shape — `/press-releases/2019/` and `?page=47` are preferred,
+`/cookie-policy` and `/login` are pushed below neutral, and assets are never fetched at all.
+
+Three things make it work in practice:
+
+- **Tunnelling.** The page you want is routinely two hops behind an index page that says
+  nothing itself. Pruning on the first low score cuts exactly the paths that lead to archives,
+  so a branch gets an allowance of consecutive off-topic hops (`tunnel_slack`, default 2)
+  before it is dropped.
+- **Pagination.** `rel="next"` and `?page=N` get a deliberate boost. Page 47 of a press
+  archive is in no search index, and that is where a ministry's history lives.
+- **Alias matching.** `discover_and_crawl` feeds the crawler every name discovery learned for
+  the subject. On one live query Wikidata returned **60** — *Sadyr Japarov*, *Садыр Жапаров*,
+  *صادیر جاپاروف* — and a link written in any of them now scores. Without this the crawler
+  sees a non-anglophone subject's own coverage as irrelevant, which is most of the coverage
+  that exists.
+
+Without `about`, the frontier stays breadth-first and every link is equal, which is the right
+behaviour for "fetch this site" and the wrong one for "find what this site says about X".
+`search_site_keyword` focuses on its keyword automatically.
 
 ## Destinations
 

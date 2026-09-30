@@ -28,6 +28,33 @@ pub async fn fetch_json(
     headers: &[(&str, &str)],
     max_body_bytes: usize,
 ) -> Result<serde_json::Value, CrawlError> {
+    let body = fetch_body(client, url, headers, max_body_bytes).await?;
+    parse_json(&body)
+}
+
+/// Parse a body as JSON, quoting what actually arrived when it is not.
+///
+/// The snippet is not decoration. An API that answers a rate limit with `200`
+/// and a sentence of prose — GDELT does exactly this — otherwise surfaces as
+/// "expected value at line 1 column 1", which tells the caller nothing about
+/// what went wrong or how to fix it.
+pub fn parse_json(body: &[u8]) -> Result<serde_json::Value, CrawlError> {
+    serde_json::from_slice(body).map_err(|e| {
+        let text = String::from_utf8_lossy(body);
+        let snippet: String = text.trim().chars().take(200).collect();
+        CrawlError::Json(format!("{e}; body began: {snippet}"))
+    })
+}
+
+/// The raw bytes of an API response, with the same retry behaviour as
+/// [`fetch_json`]. Sources whose API can answer with something other than JSON
+/// need to see the body before it is parsed.
+pub async fn fetch_body(
+    client: &Client,
+    url: &Url,
+    headers: &[(&str, &str)],
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, CrawlError> {
     allowed(url)?;
 
     let mut last_status = None;
@@ -48,8 +75,7 @@ pub async fn fetch_json(
                         }
                         body.extend_from_slice(&chunk);
                     }
-                    return serde_json::from_slice(&body)
-                        .map_err(|e| CrawlError::Json(e.to_string()));
+                    return Ok(body);
                 }
 
                 last_status = Some(status.as_u16());

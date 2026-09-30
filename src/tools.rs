@@ -1,5 +1,6 @@
 use crate::crawler::{
-    CrawlConfig, CrawlError, CrawlOutcome, build_client, canonicalize, crawl, crawl_same_domain,
+    CrawlConfig, CrawlError, CrawlOutcome, build_client, canonicalize, crawl, crawl_from,
+    crawl_same_domain,
     extract_links, extract_metadata, extract_text, extract_text_md, fetch_page,
     fetch_page_headless, login_and_fetch, search_site,
 };
@@ -10,9 +11,13 @@ use rmcp::{
     model::{Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
+use crate::discovery::{DiscoveryBudget, DiscoverySource, Federated, Query, federate};
+use crate::scoring::Terms;
 use crate::sitemap::{self, SitemapConfig};
+use crate::sources::{brave::Brave, gdelt::Gdelt, wayback::Wayback, wikidata::Wikidata};
 use crate::structured::{self, StructuredData};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -53,6 +58,65 @@ fn list_urls(urls: &[String]) -> String {
         "\n… and {} more (not listed)",
         urls.len() - MAX_LISTED
     ));
+    out
+}
+
+/// Brave is registered only when a key is configured: a backend that reports
+/// the same failure on every call is worse than one that is simply absent.
+/// `None` for an absent or blank subject, which keeps the frontier
+/// breadth-first rather than scoring everything at zero.
+fn focus_from(about: Option<&str>) -> Option<Terms> {
+    let terms = Terms::new(about.into_iter());
+    Some(terms).filter(|t| !t.is_empty())
+}
+
+fn built_in_sources() -> Vec<Box<dyn DiscoverySource>> {
+    let mut sources: Vec<Box<dyn DiscoverySource>> = vec![
+        Box::new(Gdelt::new()),
+        Box::new(Wikidata::new()),
+        Box::new(Wayback::new()),
+    ];
+    if let Some(brave) = Brave::from_env() {
+        sources.push(Box::new(brave));
+    }
+    sources
+}
+
+fn discovery_report(outcome: &Federated) -> String {
+    let mut out = format!(
+        "{} candidate URL(s).{}\n\n",
+        outcome.leads.len(),
+        match outcome.failures.len() {
+            0 => String::new(),
+            n => format!(" {n} source(s) failed — results are partial."),
+        }
+    );
+
+    for (name, why) in &outcome.failures {
+        out.push_str(&format!("{name} failed: {why}\n"));
+    }
+    if !outcome.failures.is_empty() {
+        out.push('\n');
+    }
+
+    for lead in &outcome.leads {
+        out.push_str(&format!("[{:.2}] {}\n", lead.score, lead.url));
+        let mut detail: Vec<String> = Vec::new();
+        if let Some(title) = &lead.title {
+            detail.push(title.clone());
+        }
+        for field in [&lead.domain, &lead.language, &lead.seen] {
+            if let Some(value) = field {
+                detail.push(value.clone());
+            }
+        }
+        detail.push(format!(
+            "via {}",
+            lead.sources.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" + ")
+        ));
+        out.push_str(&format!("       {}\n", detail.join(" — ")));
+    }
+
     out
 }
 
@@ -103,17 +167,23 @@ fn structured_report(data: &StructuredData, base: &Url) -> String {
 
 fn report(outcome: &CrawlOutcome) -> String {
     let urls = outcome.urls();
+    let focused = outcome.pages.iter().any(|p| p.relevance > 0.0);
     // Where the URLs came from, not which URL came from where: naming the
     // parent of every link would be most of the output and none of the value.
-    let origins = outcome
-        .origin_counts()
-        .iter()
-        .map(|(kind, count)| format!("{count} {kind}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let origins = match outcome.origin_counts().as_slice() {
+        [] => String::new(),
+        counts => format!(
+            "\nFound via: {}.",
+            counts
+                .iter()
+                .map(|(kind, count)| format!("{count} {kind}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
 
     let mut out = format!(
-        "Fetched {} page(s); {} failed; {} skipped by robots.txt.{}\nFound via: {origins}.\n\n",
+        "Fetched {} page(s); {} failed; {} skipped by robots.txt.{}{}\n\n",
         urls.len(),
         outcome.failed.len(),
         outcome.robots_skipped,
@@ -121,10 +191,30 @@ fn report(outcome: &CrawlOutcome) -> String {
             " Page budget reached — results are partial."
         } else {
             ""
-        }
+        },
+        origins
     );
 
-    out.push_str(&list_urls(&urls));
+    if focused {
+        // Best first. For a focused crawl the relevant pages are the answer,
+        // and the order they happened to be fetched in is not interesting.
+        let mut ranked: Vec<(f32, &str)> = outcome
+            .pages
+            .iter()
+            .map(|page| (page.relevance, page.url.as_str()))
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let listed = ranked.len().min(MAX_LISTED);
+        for (relevance, url) in &ranked[..listed] {
+            out.push_str(&format!("[{relevance:.2}] {url}\n"));
+        }
+        if ranked.len() > listed {
+            out.push_str(&format!("… and {} more (not listed)\n", ranked.len() - listed));
+        }
+    } else {
+        out.push_str(&list_urls(&urls));
+    }
 
     if !outcome.failed.is_empty() {
         out.push_str("\n\nFailed:\n");
@@ -168,6 +258,15 @@ pub struct CrawlInput {
     )]
     #[serde(default)]
     pub seed_from_sitemap: Option<bool>,
+    #[schemars(
+        description = "What the crawl is looking for. Given this, links are scored before they \
+                       are opened — archive indexes and paginated lists are preferred, cookie \
+                       and login pages avoided — so the budget goes to pages about the subject \
+                       rather than to whatever a page happens to list first. Without it the \
+                       crawl is plain breadth-first."
+    )]
+    #[serde(default)]
+    pub about: Option<String>,
 }
 
 impl CrawlInput {
@@ -183,6 +282,7 @@ impl CrawlInput {
             max_depth: self.depth.unwrap_or(d.max_depth).clamp(1, 20),
             respect_robots: self.respect_robots.unwrap_or(d.respect_robots),
             seed_from_sitemap: self.seed_from_sitemap.unwrap_or(false),
+            focus: focus_from(self.about.as_deref()),
             ..d
         }
     }
@@ -212,6 +312,9 @@ impl SearchInput {
             max_pages: self.max_pages.unwrap_or(d.max_pages).clamp(1, 10_000),
             max_depth: self.depth.unwrap_or(d.max_depth).clamp(1, 20),
             same_domain_only: self.same_domain_only.unwrap_or(false),
+            // The keyword already says what the crawl is looking for, so
+            // spending the budget on pages likely to contain it is free.
+            focus: focus_from(Some(&self.keyword)),
             ..d
         }
     }
@@ -257,6 +360,114 @@ impl SitemapInput {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DiscoverInput {
+    #[schemars(
+        description = "What to look for. Quote a phrase to match it as a phrase. GDELT also \
+                       accepts its own operators, such as sourcelang:spanish or domain:un.org."
+    )]
+    pub query: String,
+    #[schemars(description = "Earliest date to consider, as YYYYMMDD. Optional.")]
+    #[serde(default)]
+    pub since: Option<String>,
+    #[schemars(description = "Latest date to consider, as YYYYMMDD. Optional.")]
+    #[serde(default)]
+    pub until: Option<String>,
+    #[schemars(description = "Maximum candidate URLs to return. Default 50, max 250.")]
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    #[schemars(
+        description = "Hosts to expand wholesale, e.g. mfa.gov.kg. Archive sources (Wayback) \
+                       search by site rather than by text, so they contribute only when this \
+                       is given."
+    )]
+    #[serde(default)]
+    pub sites: Option<Vec<String>>,
+}
+
+impl DiscoverInput {
+    fn budget(&self) -> DiscoveryBudget {
+        let d = DiscoveryBudget::default();
+        DiscoveryBudget {
+            max_candidates: self.max_results.unwrap_or(d.max_candidates).clamp(1, 250),
+            ..d
+        }
+    }
+
+    /// Both bounds are optional, but a malformed one is a mistake worth
+    /// reporting rather than quietly dropping — a search silently run over all
+    /// of time looks like a working search.
+    fn window(&self) -> Result<Query, String> {
+        for (label, value) in [("since", &self.since), ("until", &self.until)] {
+            if let Some(value) = value
+                && !(value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Err(format!("{label} must be a YYYYMMDD date, got \"{value}\""));
+            }
+        }
+        Ok(Query {
+            text: self.query.clone(),
+            since: self.since.clone(),
+            until: self.until.clone(),
+            sites: self.sites.clone().unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResearchInput {
+    #[schemars(description = "What to look for, as in discover.")]
+    pub query: String,
+    #[schemars(description = "Earliest date to consider, as YYYYMMDD. Optional.")]
+    #[serde(default)]
+    pub since: Option<String>,
+    #[schemars(description = "Latest date to consider, as YYYYMMDD. Optional.")]
+    #[serde(default)]
+    pub until: Option<String>,
+    #[schemars(description = "Candidate URLs to gather before fetching. Default 50, max 250.")]
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    #[schemars(description = "Pages to actually fetch, best-scoring first. Default 25.")]
+    #[serde(default)]
+    pub max_pages: Option<usize>,
+    #[schemars(description = "Hosts to expand wholesale, as in discover.")]
+    #[serde(default)]
+    pub sites: Option<Vec<String>>,
+    #[schemars(
+        description = "How many link hops to follow from each candidate. Default 2 — links are \
+                       scored before they are opened, so following them is productive rather \
+                       than indiscriminate."
+    )]
+    #[serde(default)]
+    pub depth: Option<u32>,
+}
+
+impl ResearchInput {
+    fn discovery(&self) -> DiscoverInput {
+        DiscoverInput {
+            query: self.query.clone(),
+            since: self.since.clone(),
+            until: self.until.clone(),
+            max_results: self.max_results,
+            sites: self.sites.clone(),
+        }
+    }
+
+    /// Following links from a federated frontier is only worth doing because
+    /// the links are scored first: without a subject to score against, every
+    /// hop multiplies the work by whatever a page happens to link to. With one,
+    /// the hops are how the crawl reaches the paginated archives no index
+    /// covers.
+    fn config(&self, focus: Terms) -> CrawlConfig {
+        CrawlConfig {
+            max_pages: self.max_pages.unwrap_or(25).clamp(1, 1_000),
+            max_depth: self.depth.unwrap_or(2).clamp(0, 10),
+            focus: Some(focus).filter(|terms| !terms.is_empty()),
+            ..CrawlConfig::default()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoginInput {
     #[schemars(description = "The URL to login to")]
     pub url: String,
@@ -267,6 +478,9 @@ pub struct LoginInput {
 #[derive(Debug, Clone)]
 pub struct Crawler {
     client: Client,
+    /// Held on the server rather than built per call, so per-source rate limits
+    /// persist between tool invocations — which is when they get breached.
+    sources: Arc<Vec<Box<dyn DiscoverySource>>>,
 }
 
 impl Crawler {
@@ -274,6 +488,7 @@ impl Crawler {
         Self {
             client: build_client(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
                 .expect("HTTP client configuration is static and always valid"),
+            sources: Arc::new(built_in_sources()),
         }
     }
 
@@ -436,6 +651,71 @@ impl Crawler {
                 cap(out)
             }
             Err(e) => format!("Could not read sitemap: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Find candidate URLs about a topic when you have no seed URL to start \
+                       from. Fans the query across federated discovery sources — currently \
+                       GDELT's worldwide multilingual news index — and returns ranked URLs with \
+                       the source that found each one. Use it before the crawl tools, then feed \
+                       the URLs you want into fetch_content, extract_structured_data or \
+                       crawl_site."
+    )]
+    async fn discover(&self, Parameters(input): Parameters<DiscoverInput>) -> String {
+        let query = match input.window() {
+            Ok(query) => query,
+            Err(e) => return e,
+        };
+        let outcome = federate(&self.client, &self.sources, &query, &input.budget()).await;
+        cap(discovery_report(&outcome))
+    }
+
+    #[tool(
+        description = "Discover candidate URLs for a topic and fetch them in one step: federates \
+                       the query across discovery sources, merges the results into a single \
+                       crawl frontier best-scoring first, and fetches within one page budget. \
+                       Use when you want the pages themselves rather than a list to triage."
+    )]
+    async fn discover_and_crawl(&self, Parameters(input): Parameters<ResearchInput>) -> String {
+        let discovery = input.discovery();
+        let query = match discovery.window() {
+            Ok(query) => query,
+            Err(e) => return e,
+        };
+
+        let outcome = federate(&self.client, &self.sources, &query, &discovery.budget()).await;
+        let failures = outcome.failures.clone();
+
+        // The query, plus every name discovery learned for the same subject.
+        // This is what lets a link whose anchor text is in the subject's own
+        // language score above zero.
+        let mut names = vec![input.query.clone()];
+        names.extend(outcome.terms.clone());
+        let focus = Terms::new(&names);
+        let aliases = names.len() - 1;
+
+        let seeds = outcome.seeds();
+        if seeds.is_empty() {
+            return format!("No candidate URLs for \"{}\".", input.query);
+        }
+
+        let found = seeds.len();
+        match crawl_from(&self.client, seeds, &input.config(focus)).await {
+            Ok(crawled) => {
+                let mut out = format!(
+                    "{found} candidate(s) discovered; scoring links against {} name(s) for the \
+                     subject.\n",
+                    aliases + 1
+                );
+                for (name, why) in &failures {
+                    out.push_str(&format!("{name} failed: {why}\n"));
+                }
+                out.push('\n');
+                out.push_str(&report(&crawled));
+                cap(out)
+            }
+            Err(e) => format!("Discovery found {found} URL(s) but the crawl failed: {e}"),
         }
     }
 

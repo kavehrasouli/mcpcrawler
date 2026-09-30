@@ -1,8 +1,11 @@
 mod api;
 mod crawler;
+mod discovery;
 mod net;
 mod passmanager;
+mod scoring;
 mod sitemap;
+mod sources;
 mod structured;
 mod tools;
 
@@ -10,6 +13,8 @@ use rmcp::ServiceExt;
 use tokio::io::{stdin, stdout};
 use tools::Crawler;
 
+#[cfg(test)]
+mod fa_probe;
 #[cfg(test)]
 mod tests;
 
