@@ -1769,3 +1769,55 @@ async fn an_empty_search_term_is_refused() {
     // count one larger than the page length.
     assert!(search_site(&test_client(), &server.url("/"), "   ", &cfg).await.is_err());
 }
+
+
+// *** Persian and Arabic ***
+//
+// Persian and Arabic keyboards produce different code points for what is the
+// same letter, and both spellings of a name circulate. These were all misses
+// before Arabic-script folding existed.
+
+#[test]
+fn persian_and_arabic_spellings_of_one_word_match() {
+    let cases = [
+        // Farsi yeh against Arabic yeh.
+        ("صادیر جاپاروف", "صادير جاپاروف امروز"),
+        // Farsi kaf against Arabic kaf.
+        ("کوروش", "كوروش"),
+        // Alef with hamza against bare alef.
+        ("ایران", "إيران"),
+        // Heh against teh marbuta.
+        ("مدرسه", "مدرسة"),
+        // A single fatha must not split the word in two.
+        ("سلام", "سَلام"),
+        // Persian digits against ASCII.
+        ("۱۴۰۲", "1402"),
+        // Zero-width non-joiner against a space.
+        ("می‌رود", "می رود"),
+    ];
+    for (term, text) in cases {
+        assert_eq!(Terms::new([term]).match_strength(text), 1.0, "{term} should match {text}");
+    }
+}
+
+#[test]
+fn hijri_years_count_as_dates() {
+    let dated = |u: &str| Shape::of(&canonicalize(u).unwrap()).dated;
+    // Iranian archives are sliced by the Solar Hijri calendar, in either digit set.
+    assert!(dated("https://x.ir/news/1402/"));
+    assert!(dated("https://x.ir/news/%DB%B1%DB%B4%DB%B0%DB%B2/"));
+    assert!(dated("https://x.test/news/2023/"));
+    assert!(!dated("https://x.test/news/1750/"));
+}
+
+#[test]
+fn a_persian_archive_link_is_on_topic() {
+    let terms = Terms::new(["صادیر جاپاروف"]);
+    // Percent-encoded on the wire; decoded, it is an archive folder and a
+    // Persian-calendar year — which is where a ministry's history sits.
+    let archive = score_link(&link("https://x.ir/آرشیو/۱۴۰۲/", "آرشیو"), &terms, 0.0).unwrap();
+    assert!(archive >= ON_TOPIC, "got {archive}");
+
+    let named = score_link(&link("https://x.ir/news/1", "صادیر جاپاروف با هیئت دیدار کرد"), &terms, 0.0).unwrap();
+    assert!(named >= ON_TOPIC, "got {named}");
+}

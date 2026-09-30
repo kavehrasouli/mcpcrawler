@@ -369,10 +369,15 @@ impl Shape {
     }
 }
 
+/// A four-digit year in any calendar a news archive is likely to be sliced by:
+/// Gregorian (19xx, 20xx), and Solar and Lunar Hijri (13xx, 14xx) — an Iranian
+/// ministry files its press releases under `/۱۴۰۲/`, not `/2023/`. Persian and
+/// Arabic-Indic digits have already been folded to ASCII by the time a path
+/// segment gets here.
 fn is_year(token: &str) -> bool {
     token.len() == 4
         && token.chars().all(|c| c.is_ascii_digit())
-        && matches!(&token[..2], "19" | "20")
+        && matches!(&token[..2], "13" | "14" | "19" | "20")
 }
 
 /// Score a link, or `None` if it should never be fetched at all.

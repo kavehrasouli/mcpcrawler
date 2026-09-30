@@ -14,8 +14,6 @@ use tokio::io::{stdin, stdout};
 use tools::Crawler;
 
 #[cfg(test)]
-mod fa_probe;
-#[cfg(test)]
 mod tests;
 
 #[tokio::main]

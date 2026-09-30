@@ -148,6 +148,10 @@ Three things make it work in practice:
   *صادیر جاپاروف* — and a link written in any of them now scores. Without this the crawler
   sees a non-anglophone subject's own coverage as irrelevant, which is most of the coverage
   that exists.
+- **Arabic script.** Persian and Arabic keyboards produce different code points for the same
+  letter (`ی`/`ي`, `ک`/`ك`), and both spellings circulate. These fold together, along with alef
+  variants, teh marbuta, diacritics and Persian digits. Non-ASCII URL paths are decoded, so an
+  archive at `/آرشیو/۱۴۰۲/` is recognised as one — including its Solar Hijri year.
 
 Without `about`, the frontier stays breadth-first and every link is equal, which is the right
 behaviour for "fetch this site" and the wrong one for "find what this site says about X".
