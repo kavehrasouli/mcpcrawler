@@ -176,6 +176,102 @@ impl Terms {
         // Partial credit, but never as much as a full phrase match.
         (hits as f32 / self.words.len() as f32).min(0.9)
     }
+
+    /// The sentences of `text` that mention the subject, best first picked and
+    /// then put back in reading order.
+    ///
+    /// For a reader that has to extract facts without opening the page: the
+    /// start of an article is a headline and a dateline, while the sentence
+    /// that says where the president went is wherever it happens to be. `None`
+    /// when nothing mentions the subject, rather than the start of the page
+    /// passed off as an excerpt.
+    ///
+    /// With `near` — a place, say — a sentence that also mentions it outranks
+    /// any that does not. Among equals the longer sentence wins: an infobox
+    /// fragment like "Parvin Ahmadinejad (sister)" matches the name as well as
+    /// a sentence about a visit does, and says nothing.
+    pub fn excerpt(&self, text: &str, near: Option<&Terms>) -> Option<String> {
+        // Sentences, not lines: an article paragraph is one long line, and
+        // clipping it from the front loses exactly the part that names the
+        // subject.
+        let mut scored: Vec<(usize, f32, &str)> = text
+            .lines()
+            .flat_map(sentences)
+            .map(str::trim)
+            .enumerate()
+            // A bare "Menu" or a date is not a sentence about anything.
+            .filter(|(_, line)| reading_length(line) >= EXCERPT_MIN_CHARS)
+            .map(|(at, line)| (at, self.match_strength(line), line))
+            .filter(|(_, strength, _)| *strength > 0.0)
+            .collect();
+        if scored.is_empty() {
+            return None;
+        }
+        let bonus = |line: &str| -> f32 {
+            // Worth more than any difference in how well the subject matched.
+            near.map_or(0.0, |n| if n.match_strength(line) > 0.0 { 2.0 } else { 0.0 })
+        };
+        // Strongest first, then longest; the earlier line wins what is left.
+        scored.sort_by(|a, b| {
+            (b.1 + bonus(b.2))
+                .total_cmp(&(a.1 + bonus(a.2)))
+                .then(reading_length(b.2).cmp(&reading_length(a.2)))
+                .then(a.0.cmp(&b.0))
+        });
+        scored.truncate(EXCERPT_LINES);
+        scored.sort_by_key(|(at, _, _)| *at);
+
+        Some(
+            scored
+                .into_iter()
+                .map(|(_, _, line)| clip(line, EXCERPT_LINE_CHARS))
+                .collect::<Vec<_>>()
+                .join(" … "),
+        )
+    }
+}
+
+/// `line` split after sentence-ending punctuation that is followed by space,
+/// including the full stops of CJK, Arabic and Devanagari. An abbreviation
+/// ("Mr. Japarov") splits too early, which costs a fragment, not a fact.
+fn sentences(line: &str) -> impl Iterator<Item = &str> {
+    let mut start = 0;
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let ends = matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '؟' | '।');
+        let wide = matches!(c, '。' | '！' | '？');
+        if ends && (wide || chars.peek().is_none_or(|(_, next)| next.is_whitespace())) {
+            cuts.push(at + c.len_utf8());
+        }
+    }
+    cuts.push(line.len());
+    cuts.into_iter().filter_map(move |end| {
+        let piece = line.get(start..end);
+        start = end;
+        piece
+    })
+}
+
+/// Length as a reader sees it: one Han, kana or hangul character carries about
+/// what a short Latin word does, so counting them as one each would call a full
+/// Chinese sentence too short to bother with.
+fn reading_length(text: &str) -> usize {
+    text.chars().map(|c| if c as u32 >= 0x2E80 { 3 } else { 1 }).sum()
+}
+
+/// Fewest characters a sentence needs to be worth excerpting.
+const EXCERPT_MIN_CHARS: usize = 25;
+/// Sentences kept per page, and the longest each may run.
+const EXCERPT_LINES: usize = 3;
+const EXCERPT_LINE_CHARS: usize = 240;
+
+/// `line` cut to `max` characters on a character boundary.
+fn clip(line: &str, max: usize) -> String {
+    match line.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", line[..cut].trim_end()),
+        None => line.to_string(),
+    }
 }
 
 /// Lowercase, fold the Latin accents transliteration disagrees about, and

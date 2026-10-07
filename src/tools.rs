@@ -103,14 +103,25 @@ async fn run_discovery(
     let max = input.max_queries.unwrap_or(expand::DEFAULT_QUERIES);
     let done = expand::research(client, sources, &query, input.place.as_deref(), max, &budget).await;
     let bound = |d: &Option<String>| d.clone().unwrap_or_else(|| "open".to_string());
-    let mut note = format!(
-        "Expanded: {} more quer{} over {}–{}, plus the original.\n",
-        done.queries.len(),
-        if done.queries.len() == 1 { "y" } else { "ies" },
-        bound(&done.window.from),
-        bound(&done.window.to),
-    );
-    for q in &done.queries {
+    let planned = done.queries.len();
+    let mut note = if done.ran == 0 && planned > 0 {
+        // Said plainly: a list of queries that reads as if they were run is
+        // the same as claiming the results came from them.
+        format!(
+            "Expansion planned {planned} more quer{} but none ran: every text-search source had \
+             already failed.\n",
+            if planned == 1 { "y" } else { "ies" }
+        )
+    } else {
+        format!(
+            "Expanded: {} of {planned} planned quer{} ran, over {}–{}, plus the original.\n",
+            done.ran,
+            if planned == 1 { "y" } else { "ies" },
+            bound(&done.window.from),
+            bound(&done.window.to),
+        )
+    };
+    for q in done.queries.iter().take(done.ran) {
         note.push_str(&format!("  - {} [{}–{}]\n", q.text, bound(&q.since), bound(&q.until)));
     }
     note.push('\n');
@@ -200,37 +211,50 @@ fn structured_report(data: &StructuredData, base: &Url) -> String {
     out
 }
 
-/// ` — also on a.com, b.com (+3)`: the hosts carrying the same story, which is
-/// itself the evidence that it was syndicated.
+/// `20240305` -> `2024-03-05`.
+fn iso(date: &str) -> String {
+    format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8])
+}
+
+/// ` — also on a.com, b.com (+3)`: the other hosts carrying the same story,
+/// which is itself the evidence that it was syndicated. Hosts, not copies:
+/// three copies on one site are one outlet repeating itself, and say so.
 fn copies_note(outcome: &CrawlOutcome, group: &Group) -> String {
     if group.copies.is_empty() {
         return String::new();
     }
-    let mut hosts: Vec<&str> = Vec::new();
-    for copy in &group.copies {
-        if let Some(host) = outcome.pages[*copy].url.host_str()
-            && !hosts.contains(&host)
-        {
-            hosts.push(host);
-        }
+    let hosts = dedup::story_hosts(&outcome.pages, group);
+    let others = &hosts[hosts.len().min(1)..];
+    if others.is_empty() {
+        return format!(" — {} more cop{} on the same host", group.copies.len(),
+            if group.copies.len() == 1 { "y" } else { "ies" });
     }
-    let shown = hosts.len().min(3);
-    // Copies not accounted for by a named host, which may be several per host.
-    let more = group
-        .copies
-        .iter()
-        .filter(|c| {
-            outcome.pages[**c].url.host_str().is_none_or(|h| !hosts[..shown].contains(&h))
-        })
-        .count();
-    let mut note = format!(" — also on {}", hosts[..shown].join(", "));
-    if more > 0 {
-        note.push_str(&format!(" (+{more})"));
+    let mut note = format!(" — also on {}", others[..others.len().min(3)].join(", "));
+    if others.len() > 3 {
+        note.push_str(&format!(" (+{})", others.len() - 3));
     }
     note
 }
 
 pub(crate) fn report(outcome: &CrawlOutcome) -> String {
+    report_with(outcome, None)
+}
+
+/// What to excerpt for: the subject, and optionally a place that makes a
+/// sentence worth more when it appears alongside.
+pub(crate) struct Excerpts<'a> {
+    pub subject: &'a Terms,
+    pub near: Option<&'a Terms>,
+}
+
+/// Most stories listed when each carries an excerpt. A hundred paragraphs is
+/// not a list a model can read; they are best-first, so the cut loses the
+/// least relevant.
+const MAX_EXCERPTED: usize = 25;
+
+/// As [`report`], and with `Some(terms)` each story is followed by the lines
+/// that mention the subject.
+pub(crate) fn report_with(outcome: &CrawlOutcome, excerpts: Option<&Excerpts>) -> String {
     let urls = outcome.urls();
     let focused = outcome.pages.iter().any(|p| p.relevance > 0.0);
     // Where the URLs came from, not which URL came from where: naming the
@@ -280,15 +304,38 @@ pub(crate) fn report(outcome: &CrawlOutcome) -> String {
             outcome.pages[b.best].relevance.total_cmp(&outcome.pages[a.best].relevance)
         });
     }
-    let listed = shown.len().min(MAX_LISTED);
+    let year = expand::this_year() + 1;
+    let dates: Vec<Option<String>> =
+        groups.iter().map(|g| dedup::story_date(&outcome.pages, g, year)).collect();
+    let dated: Vec<&String> = dates.iter().flatten().collect();
+    if let (Some(first), Some(last)) = (dated.iter().min(), dated.iter().max()) {
+        out.push_str(&format!(
+            "{} of {} stories carry a publish date, from {} to {}.\n",
+            dated.len(),
+            groups.len(),
+            iso(first),
+            iso(last)
+        ));
+    }
+
+    let listed = shown.len().min(if excerpts.is_some() { MAX_EXCERPTED } else { MAX_LISTED });
     for group in &shown[..listed] {
         let page = &outcome.pages[group.best];
         if focused {
             out.push_str(&format!("[{:.2}] ", page.relevance));
         }
         out.push_str(page.url.as_str());
+        let at = groups.iter().position(|g| std::ptr::eq(g, *group));
+        if let Some(date) = at.and_then(|i| dates[i].as_deref()) {
+            out.push_str(&format!(" ({})", iso(date)));
+        }
         out.push_str(&copies_note(outcome, group));
         out.push('\n');
+        if let Some(wanted) = excerpts
+            && let Some(lines) = wanted.subject.excerpt(&extract_text(&page.html), wanted.near)
+        {
+            out.push_str(&format!("    {lines}\n"));
+        }
     }
     if shown.len() > listed {
         out.push_str(&format!("… and {} more (not listed)\n", shown.len() - listed));
@@ -540,6 +587,13 @@ pub struct ResearchInput {
     #[schemars(description = "With expand: how many query variants to run. Default 8, max 20.")]
     #[serde(default)]
     pub max_queries: Option<usize>,
+    #[schemars(
+        description = "Under each story, include the lines of the page that mention the \
+                       subject, so dates, places and who was present can be read without \
+                       fetching the page again. Lists at most 25 stories. Default false."
+    )]
+    #[serde(default)]
+    pub excerpts: Option<bool>,
 }
 
 impl ResearchInput {
@@ -794,6 +848,8 @@ impl Crawler {
         let mut names = vec![input.query.clone()];
         names.extend(outcome.terms.clone());
         let focus = Terms::new(&names);
+        let place_terms = input.place.as_deref().map(|p| Terms::new([p])).filter(|t| !t.is_empty());
+        let excerpt_terms = (input.excerpts == Some(true)).then(|| (focus.clone(), place_terms));
         let aliases = names.len() - 1;
 
         let seeds = outcome.seeds();
@@ -814,7 +870,10 @@ impl Crawler {
                     out.push_str(&format!("{name} failed: {why}\n"));
                 }
                 out.push('\n');
-                out.push_str(&report(&crawled));
+                let wanted = excerpt_terms
+                    .as_ref()
+                    .map(|(subject, near)| Excerpts { subject, near: near.as_ref() });
+                out.push_str(&report_with(&crawled, wanted.as_ref()));
                 cap(out)
             }
             Err(e) => format!("Discovery found {found} URL(s) but the crawl failed: {e}"),

@@ -196,9 +196,24 @@ Fetched 40 page(s); 12 distinct after collapsing 28 near-duplicate copies. ...
 [0.82] https://example.org/visit — also on b.example, c.example (+9)
 ```
 
-The most relevant copy is shown, the earliest fetched on a tie, and the hosts carrying the
-rest are named — which is itself the evidence that a story was syndicated. Pages under 25 words
+The most relevant copy is shown, the earliest fetched on a tie, and the *other hosts* carrying
+the story are named — which is itself the evidence that it was syndicated. Hosts, not copies:
+three copies on one site are one outlet repeating itself, and the report says so. `www.` is
+ignored; beyond that independence is by host, so two outlets under one owner still count as two.
+
+Each story is dated by its earliest copy, from `article:published_time`, a `<time>` element or
+the JSON-LD record. Only ISO-shaped dates are read (`2024-03-05T10:00:00Z`); "5 March" is not
+guessed at, because a wrong date in something you sort by is worse than none. The report opens
+with how many stories carry a date and the range they span. Pages under 25 words
 are never clustered, so error pages and cookie notices do not match each other.
+
+## Excerpts
+
+`discover_and_crawl` takes `excerpts=true` to print, under each story, the sentences of the page
+that mention the subject — up to three, in reading order — so a model can read off dates, places
+and who was present without fetching every page again. Lists at most 25 stories, best first.
+Nothing is extracted by the crawler itself: it hands over deduplicated, dated stories with
+their independent hosts, and reading the facts out of them is the caller's job.
 
 ## Destinations
 

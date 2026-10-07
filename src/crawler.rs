@@ -1331,6 +1331,25 @@ pub fn extract_text_md(html: &str) -> String {
     htmd::convert(html).unwrap_or_default()
 }
 
+static PUBLISHED: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("meta[property='article:published_time'], time[datetime]").unwrap()
+});
+
+/// When the page says it was published, exactly as it says it. A meta tag or
+/// `<time>` element first; the JSON-LD record for pages that render client-side
+/// and carry nothing else. Normalising the format is the caller's business.
+pub fn published_raw(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    document
+        .select(&PUBLISHED)
+        .next()
+        .and_then(|el| el.value().attr("content").or_else(|| el.value().attr("datetime")))
+        .map(str::trim)
+        .filter(|date| !date.is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::structured::extract(html).field(&["datePublished", "dateCreated"]))
+}
+
 pub fn extract_metadata(html: &str) -> String {
     static TITLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").unwrap());
     static DESC: LazyLock<Selector> =
@@ -1345,9 +1364,6 @@ pub fn extract_metadata(html: &str) -> String {
         LazyLock::new(|| Selector::parse("meta[property='og:description']").unwrap());
     static CANONICAL: LazyLock<Selector> =
         LazyLock::new(|| Selector::parse("link[rel='canonical']").unwrap());
-    static PUBLISHED: LazyLock<Selector> = LazyLock::new(|| {
-        Selector::parse("meta[property='article:published_time'], time[datetime]").unwrap()
-    });
 
     let document = Html::parse_document(html);
 

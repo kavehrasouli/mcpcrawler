@@ -285,8 +285,12 @@ pub struct Researched {
     pub federated: Federated,
     /// The window every expanded query was bounded to.
     pub window: Span,
-    /// The expanded queries that were run, not counting the original.
+    /// The expanded queries planned, not counting the original.
     pub queries: Vec<Query>,
+    /// How many of them were actually sent. Fewer than planned when every
+    /// text-searching source had failed by then; they run in order, so these
+    /// are the first `ran`.
+    pub ran: usize,
 }
 
 /// Run `base` across every source, then the expansions across the sources
@@ -335,10 +339,12 @@ pub async fn research(
     let mut terms = first.terms;
     let mut failures = first.failures;
     let span = first.span;
+    let mut ran = 0;
     for query in &queries {
         if live.is_empty() {
             break;
         }
+        ran += 1;
         let round = federate_refs(client, &live, query, budget).await;
         leads.extend(round.leads);
         for term in round.terms {
@@ -363,5 +369,6 @@ pub async fn research(
         },
         window,
         queries,
+        ran,
     }
 }

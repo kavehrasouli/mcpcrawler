@@ -37,6 +37,9 @@ const POSITION_HELD: &str = "P39";
 const START_TIME: &str = "P580";
 const END_TIME: &str = "P582";
 
+/// `P1559`, name in native language: monolingual text, `{text, language}`.
+const NATIVE_NAME: &str = "P1559";
+
 /// `P856`, official website.
 const OFFICIAL_WEBSITE: &str = "P856";
 
@@ -236,6 +239,26 @@ fn names_of(response: &Value, id: &str) -> Vec<String> {
         }
     };
 
+    // The name in the subject's own language comes first. Labels arrive in
+    // language-code order, which puts Amharic ahead of Persian for an Iranian
+    // president; the property that says which language the person writes their
+    // own name in is a better pick than the alphabet.
+    if let Some(native) = entity
+        .get("claims")
+        .and_then(|c| c.get(NATIVE_NAME))
+        .and_then(Value::as_array)
+    {
+        for claim in native {
+            push(
+                claim
+                    .get("mainsnak")
+                    .and_then(|s| s.get("datavalue"))
+                    .and_then(|d| d.get("value"))
+                    .and_then(|v| v.get("text"))
+                    .and_then(Value::as_str),
+            );
+        }
+    }
     if let Some(labels) = entity.get("labels").and_then(Value::as_object) {
         for label in labels.values() {
             push(label.get("value").and_then(Value::as_str));

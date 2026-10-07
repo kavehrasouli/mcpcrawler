@@ -12,7 +12,7 @@
 //! story" — a different headline, a byline, a footer and a "related articles"
 //! box all move a handful of shingles out of hundreds and flip very few bits.
 
-use crate::crawler::{FetchedPage, extract_text};
+use crate::crawler::{FetchedPage, extract_text, normalize_domain, published_raw};
 use crate::scoring::normalise;
 
 /// Bits that may differ and still be one story.
@@ -129,4 +129,53 @@ pub fn group_pages(pages: &[FetchedPage]) -> Vec<Group> {
             Group { best, copies }
         })
         .collect()
+}
+
+/// `2024-03-05T10:00:00+03:00` -> `20240305`.
+///
+/// Only an ISO-shaped date, with `-` or `/` between the parts: a page that
+/// says "5 March" is not guessed at, because a wrong date is worse than none
+/// in a record someone will sort by. The time and zone are dropped, so a story
+/// published near midnight can land a day off. Years outside 1990 to
+/// `latest_year` are refused as the junk they nearly always are.
+pub fn ymd(raw: &str, latest_year: i32) -> Option<String> {
+    let head: String = raw.trim().chars().take(10).collect();
+    let mut parts = head.split(['-', '/']);
+    let (year, month, day) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str, len: usize| s.len() == len && s.chars().all(|c| c.is_ascii_digit());
+    if !(digits(year, 4) && digits(month, 2) && digits(day, 2)) {
+        return None;
+    }
+    let (y, m, d): (i32, u32, u32) = (year.parse().ok()?, month.parse().ok()?, day.parse().ok()?);
+    ((1990..=latest_year).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d))
+        .then(|| format!("{year}{month}{day}"))
+}
+
+/// When a story first appeared: the earliest date among its copies. A
+/// syndicated copy is dated when it was reposted, so the original is the
+/// earliest.
+pub fn story_date(pages: &[FetchedPage], group: &Group, latest_year: i32) -> Option<String> {
+    std::iter::once(&group.best)
+        .chain(&group.copies)
+        .filter_map(|&i| ymd(&published_raw(&pages[i].html)?, latest_year))
+        .min()
+}
+
+/// The distinct hosts carrying a story, the shown copy's first.
+///
+/// This is what independence means here: two copies on one host are one
+/// outlet repeating itself. It is host-level, not organisation-level —
+/// `news.example.com` and `example.com` count as two, and two outlets owned by
+/// one group count as two — so it overstates independence, never understates.
+pub fn story_hosts(pages: &[FetchedPage], group: &Group) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for &i in std::iter::once(&group.best).chain(&group.copies) {
+        if let Some(host) = pages[i].url.host_str() {
+            let host = normalize_domain(host).to_string();
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
 }

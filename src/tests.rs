@@ -225,6 +225,7 @@ fn body_for(path: &str) -> (u16, &'static str, Vec<u8>) {
                  "labels": {"en": {"language": "en", "value": "Sadyr Japarov"}},
                  "aliases": {"en": [{"language": "en", "value": "Sadyr Zhaparov"}]},
                  "claims": {"P856": [{"mainsnak": {"datavalue": {"value": "https://president.kg/"}}}],
+                            "P1559": [{"mainsnak": {"datavalue": {"value": {"text": "Жапаров Садыр", "language": "ky"}}}}],
                             "P39": [
                               {"qualifiers": {"P580": [{"datavalue": {"value": {"time": "+2020-10-10T00:00:00Z"}}}],
                                               "P582": [{"datavalue": {"value": {"time": "+2021-01-28T00:00:00Z"}}}]}},
@@ -2106,6 +2107,9 @@ async fn research_stops_asking_a_source_that_has_started_failing() {
     assert_eq!(log.lock().unwrap().len(), 2);
     assert_eq!(done.federated.failures.len(), 1);
     assert_eq!(done.federated.leads.len(), 1, "what it returned before failing is kept");
+    // Planned several, sent one: the report must not claim the rest.
+    assert_eq!(done.ran, 1);
+    assert!(done.queries.len() > done.ran);
 }
 
 // *** near-duplicates ***
@@ -2218,4 +2222,195 @@ fn the_report_says_how_many_distinct_stories_there_were() {
     assert!(text.contains("https://a.example/one — also on b.example\n"), "{text}");
     // Only one line per story is listed.
     assert!(!text.contains("https://b.example/two"), "{text}");
+}
+
+#[test]
+fn iso_dates_are_read_and_everything_else_is_refused_not_guessed() {
+    assert_eq!(dedup::ymd("2024-03-05T10:00:00+03:00", 2026), Some("20240305".into()));
+    assert_eq!(dedup::ymd("2024/03/05", 2026), Some("20240305".into()));
+    assert_eq!(dedup::ymd(" 2024-03-05 ", 2026), Some("20240305".into()));
+    // A wrong date in a record someone sorts by is worse than none.
+    assert_eq!(dedup::ymd("5 March 2024", 2026), None);
+    assert_eq!(dedup::ymd("03-05-2024", 2026), None);
+    assert_eq!(dedup::ymd("2024-13-05", 2026), None);
+    assert_eq!(dedup::ymd("1969-01-01", 2026), None);
+    assert_eq!(dedup::ymd("2031-01-01", 2026), None, "a date in the future is junk");
+    assert_eq!(dedup::ymd("", 2026), None);
+}
+
+fn dated_page(url: &str, body: &str, published: &str) -> FetchedPage {
+    FetchedPage {
+        url: Url::parse(url).unwrap(),
+        html: format!(
+            "<html><head><meta property='article:published_time' content='{published}'></head>\
+             <body><main>{body}</main></body></html>"
+        ),
+        origin: Origin::Seed,
+        relevance: 0.5,
+    }
+}
+
+#[test]
+fn a_story_is_dated_by_its_earliest_copy_and_counted_by_its_hosts() {
+    let story = article(7, 300);
+    let pages = vec![
+        dated_page("https://www.a.example/x", &story, "2024-03-07T09:00:00Z"),
+        dated_page("https://a.example/y", &story, "2024-03-06T09:00:00Z"),
+        dated_page("https://b.example/x", &story, "2024-03-05T23:00:00Z"),
+    ];
+    let groups = dedup::group_pages(&pages);
+    assert_eq!(groups.len(), 1);
+    // The original is the earliest; reposts are dated when they were reposted.
+    assert_eq!(dedup::story_date(&pages, &groups[0], 2026), Some("20240305".into()));
+    // `www.a.example` and `a.example` are one outlet.
+    assert_eq!(dedup::story_hosts(&pages, &groups[0]), vec!["a.example", "b.example"]);
+}
+
+#[test]
+fn the_report_dates_stories_and_names_other_hosts_not_other_copies() {
+    let story = article(7, 300);
+    let outcome = CrawlOutcome {
+        pages: vec![
+            dated_page("https://a.example/one", &story, "2024-03-05"),
+            dated_page("https://a.example/two", &story, "2024-03-06"),
+            dated_page("https://b.example/one", &story, "2024-03-06"),
+            dated_page("https://c.example/solo", &article(99, 300), "2023-01-10"),
+        ],
+        failed: vec![],
+        robots_skipped: 0,
+        budget_hit: false,
+    };
+    let text = crate::tools::report(&outcome);
+    assert!(text.contains("2 of 2 stories carry a publish date, from 2023-01-10 to 2024-03-05"), "{text}");
+    // Three copies, two hosts: one other host is named, the second copy on a.example is not.
+    assert!(text.contains("https://a.example/one (2024-03-05) — also on b.example\n"), "{text}");
+    assert!(text.contains("https://c.example/solo (2023-01-10)\n"), "{text}");
+}
+
+#[test]
+fn copies_all_on_one_host_say_so() {
+    let story = article(7, 300);
+    let outcome = CrawlOutcome {
+        pages: vec![
+            page("https://a.example/one", &story, 0.4),
+            page("https://a.example/two", &story, 0.4),
+        ],
+        failed: vec![],
+        robots_skipped: 0,
+        budget_hit: false,
+    };
+    let text = crate::tools::report(&outcome);
+    assert!(text.contains("https://a.example/one — 1 more copy on the same host"), "{text}");
+}
+
+// *** excerpts ***
+
+#[test]
+fn an_excerpt_is_the_lines_that_mention_the_subject_in_reading_order() {
+    let terms = Terms::new(["Sadyr Japarov"]);
+    let text = "Menu\n\
+                Japarov arrived in Ankara on Tuesday for a state visit.\n\
+                Weather: sunny, 24 degrees across the capital region today.\n\
+                Talks covered trade and energy, the delegation said afterwards.\n\
+                Sadyr Japarov signed three agreements with his Turkish counterpart.";
+    let excerpt = terms.excerpt(text, None).unwrap();
+    // The full-name line outranks the surname-only one but they read in page order.
+    let arrived = excerpt.find("arrived in Ankara").unwrap();
+    let signed = excerpt.find("signed three agreements").unwrap();
+    assert!(arrived < signed, "{excerpt}");
+    assert!(!excerpt.contains("Weather") && !excerpt.contains("Menu"), "{excerpt}");
+}
+
+#[test]
+fn an_excerpt_is_none_when_nothing_mentions_the_subject_and_never_the_page_start() {
+    let terms = Terms::new(["Sadyr Japarov"]);
+    assert_eq!(terms.excerpt("Welcome to the site. Here is the weather for the whole week.", None), None);
+}
+
+#[test]
+fn long_lines_are_clipped_on_a_character_boundary() {
+    let terms = Terms::new(["Жапаров"]);
+    let line = format!("Жапаров {}", "очень длинное предложение ".repeat(40));
+    let excerpt = terms.excerpt(&line, None).unwrap();
+    assert!(excerpt.chars().count() <= 241, "{}", excerpt.chars().count());
+    assert!(excerpt.ends_with('…'));
+}
+
+#[test]
+fn the_excerpt_report_shows_lines_under_each_story_and_the_plain_report_does_not() {
+    let body = format!("{}. Japarov arrived in Ankara on Tuesday for a state visit.", article(7, 300));
+    let outcome = CrawlOutcome {
+        pages: vec![dated_page("https://a.example/one", &body, "2024-03-05")],
+        failed: vec![],
+        robots_skipped: 0,
+        budget_hit: false,
+    };
+    let terms = Terms::new(["Sadyr Japarov"]);
+    let with = crate::tools::report_with(
+        &outcome,
+        Some(&crate::tools::Excerpts { subject: &terms, near: None }),
+    );
+    assert!(with.contains("https://a.example/one (2024-03-05)\n    "), "{with}");
+    assert!(with.contains("arrived in Ankara"), "{with}");
+    assert!(!crate::tools::report(&outcome).contains("arrived in Ankara"));
+}
+
+#[test]
+fn the_sentence_naming_the_subject_is_found_deep_inside_one_long_paragraph() {
+    let terms = Terms::new(["Sadyr Japarov"]);
+    // One line, as an article paragraph is: filler, then the sentence that matters.
+    let paragraph = format!(
+        "{}. President Sadyr Japarov landed in Ankara on Tuesday. {}.",
+        article(7, 120),
+        article(8, 120)
+    );
+    let excerpt = terms.excerpt(&paragraph, None).unwrap();
+    assert!(excerpt.contains("landed in Ankara on Tuesday"), "{excerpt}");
+    assert!(excerpt.chars().count() < 300, "only the sentence, not the paragraph: {excerpt}");
+}
+
+#[test]
+fn cjk_full_stops_split_sentences_without_a_following_space() {
+    // Four characters or more: shorter names are not matched in unspaced scripts at all,
+    // a limit of Terms noted in todo.md, not of excerpts.
+    let terms = Terms::new(["土耳其总统"]);
+    let text = "今天天气晴朗适合出行的人很多。土耳其总统对吉尔吉斯斯坦进行了正式访问并举行会谈。明天将有降雨天气预报如此。";
+    let excerpt = terms.excerpt(text, None).unwrap();
+    assert!(excerpt.contains("土耳其总统对吉尔吉斯斯坦"), "{excerpt}");
+    assert!(!excerpt.contains("天气晴朗"), "{excerpt}");
+}
+
+#[tokio::test]
+async fn the_native_language_name_leads_the_aliases() {
+    let server = fixture().await;
+    let wd = Wikidata::at(&server.url("/wd")).unwrap();
+    let found = wd
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap();
+    // Before the English label, so name picking reaches it first.
+    assert_eq!(found.terms[0], "Жапаров Садыр");
+}
+
+#[test]
+fn a_sentence_with_the_place_beats_one_that_only_names_the_subject() {
+    let terms = Terms::new(["Mahmoud Ahmadinejad"]);
+    let near = Terms::new(["Venezuela"]);
+    // Five sentences name the subject and only three are kept. The place sentence is
+    // the shortest, so only the place can get it in ahead of the longer ones.
+    let text = "Mahmoud Ahmadinejad was born in the village of Aradan in the Semnan Province.\n\
+                Mahmoud Ahmadinejad studied civil engineering at the Iran University of Science.\n\
+                Mahmoud Ahmadinejad served as the mayor of Tehran from 2003 until 2005.\n\
+                Mahmoud Ahmadinejad won the presidential election in the summer of 2005.\n\
+                Mahmoud Ahmadinejad visited Venezuela.";
+    let with_place = terms.excerpt(text, Some(&near)).unwrap();
+    assert!(with_place.contains("Venezuela"), "{with_place}");
+    // Not asked about a place, the same page's excerpt leaves it out.
+    let without = terms.excerpt(text, None).unwrap();
+    assert!(!without.contains("Venezuela"), "{without}");
+    // And among equals the longer sentence beats a short fragment.
+    let fragment = terms
+        .excerpt("Mahmoud Ahmadinejad (sister)\nMahmoud Ahmadinejad flew to Caracas for talks in 2007.", None)
+        .unwrap();
+    assert!(fragment.starts_with("Mahmoud Ahmadinejad ("), "both are kept, in page order: {fragment}");
 }
