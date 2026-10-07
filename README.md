@@ -157,6 +157,49 @@ Without `about`, the frontier stays breadth-first and every link is equal, which
 behaviour for "fetch this site" and the wrong one for "find what this site says about X".
 `search_site_keyword` focuses on its keyword automatically.
 
+## Query expansion
+
+`discover` and `discover_and_crawl` take `expand=true` to search for a subject under more than
+the words typed:
+
+```
+discover query="Sadyr Japarov" place="Turkey" expand=true
+```
+
+The first round runs on every source as usual. Wikidata answers it with the subject's other
+names and, where it records them, the dates the subject held office. Those build the variants:
+
+- **Names.** The query, then alternately a script not yet used and a further romanisation, up
+  to four. Names that differ only by case or accent count as one. Native-script aliases are
+  what reach a non-anglophone subject's own press.
+- **Window.** Your `since`/`until`, narrowed to the term. If they do not overlap, yours win.
+- **Year slices.** The primary name run over contiguous slices of the window, so a backend's
+  per-query result cap applies to each slice rather than to the whole term.
+- **Predicates.** `visit`, `"state visit"`, `"trip to"` and so on, each across every name.
+
+Only the text-searching sources rerun; Wikidata and Wayback answer the same whatever the
+wording, so they run once. A source that fails in one round is not asked again. The output
+lists every variant it ran. `max_queries` (default 8, max 20) bounds the cost: GDELT answers one
+request every five seconds, so eight variants take about forty.
+
+The predicate words are English. Language coverage comes from the names.
+
+## Near-duplicates
+
+One wire story about a state visit appears nearly verbatim on hundreds of sites. Crawl
+reports collapse these: pages are fingerprinted on the text they carry (a 64-bit SimHash over
+three-word shingles, so a different headline, byline or footer does not matter), and copies
+within 3 bits of a story's first page are one story.
+
+```
+Fetched 40 page(s); 12 distinct after collapsing 28 near-duplicate copies. ...
+[0.82] https://example.org/visit — also on b.example, c.example (+9)
+```
+
+The most relevant copy is shown, the earliest fetched on a tie, and the hosts carrying the
+rest are named — which is itself the evidence that a story was syndicated. Pages under 25 words
+are never clustered, so error pages and cookie notices do not match each other.
+
 ## Destinations
 
 By default the crawler will only connect to public unicast addresses. Loopback, private,

@@ -185,7 +185,7 @@ impl Terms {
 /// lowercasing is meaningful for Cyrillic and Greek, and a no-op for Arabic.
 /// This is not a substitute for full Unicode normalisation — it is the part
 /// that matters for matching names across romanisations.
-fn normalise(text: &str) -> String {
+pub fn normalise(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push(' ');
     let mut last_was_space = true;

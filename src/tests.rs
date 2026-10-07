@@ -1,6 +1,8 @@
 use crate::api;
 use crate::crawler::*;
-use crate::discovery::{DiscoveryBudget, DiscoverySource, Found, Lead, Query, federate};
+use crate::discovery::{DiscoveryBudget, DiscoverySource, Found, Lead, Query, Span, federate};
+use crate::dedup;
+use crate::expand::{self, Plan};
 use crate::scoring::{LinkContext, ON_TOPIC, Shape, Terms, score_link};
 use crate::sources::{brave::Brave, gdelt::Gdelt, wayback::Wayback, wikidata::Wikidata};
 use crate::net::{self, NetPolicy};
@@ -222,7 +224,12 @@ fn body_for(path: &str) -> (u16, &'static str, Vec<u8>) {
             r#"{"entities": {"Q25597826": {
                  "labels": {"en": {"language": "en", "value": "Sadyr Japarov"}},
                  "aliases": {"en": [{"language": "en", "value": "Sadyr Zhaparov"}]},
-                 "claims": {"P856": [{"mainsnak": {"datavalue": {"value": "https://president.kg/"}}}]},
+                 "claims": {"P856": [{"mainsnak": {"datavalue": {"value": "https://president.kg/"}}}],
+                            "P39": [
+                              {"qualifiers": {"P580": [{"datavalue": {"value": {"time": "+2020-10-10T00:00:00Z"}}}],
+                                              "P582": [{"datavalue": {"value": {"time": "+2021-01-28T00:00:00Z"}}}]}},
+                              {"qualifiers": {"P580": [{"datavalue": {"value": {"time": "+2021-01-28T00:00:00Z"}}}]}}
+                            ]},
                  "sitelinks": {
                    "enwiki": {"site": "enwiki", "title": "Sadyr Japarov",
                               "url": "https://en.wikipedia.org/wiki/Sadyr_Japarov"},
@@ -1820,4 +1827,395 @@ fn a_persian_archive_link_is_on_topic() {
 
     let named = score_link(&link("https://x.ir/news/1", "صادیر جاپاروف با هیئت دیدار کرد"), &terms, 0.0).unwrap();
     assert!(named >= ON_TOPIC, "got {named}");
+}
+
+// *** query expansion ***
+
+fn span(from: Option<&str>, to: Option<&str>) -> Span {
+    Span { from: from.map(str::to_string), to: to.map(str::to_string) }
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+fn plan<'a>(query: &'a str, aliases: &'a [String], window: &'a Span, max: usize) -> Plan<'a> {
+    Plan { query, names: aliases, place: None, window, max_queries: max, this_year: 2026 }
+}
+
+#[tokio::test]
+async fn wikidata_reports_the_tenure_and_leaves_a_post_still_held_open() {
+    let server = fixture().await;
+    let wd = Wikidata::at(&server.url("/wd")).unwrap();
+    let found = wd
+        .discover(&test_client(), &test_query(), &DiscoveryBudget::default())
+        .await
+        .unwrap();
+    // Earliest start across both claims; the second has no end, so still held.
+    assert_eq!(found.span, Some(span(Some("20201010"), None)));
+}
+
+#[test]
+fn tenure_closes_when_every_post_has_ended_and_widens_partial_dates() {
+    let entity = |claims: &str| {
+        serde_json::from_str::<serde_json::Value>(&format!(
+            r#"{{"entities": {{"Q1": {{"claims": {{"P39": {claims}}}}}}}}}"#
+        ))
+        .unwrap()
+    };
+    let closed = entity(
+        r#"[{"qualifiers": {"P580": [{"datavalue": {"value": {"time": "+2010-00-00T00:00:00Z"}}}],
+                            "P582": [{"datavalue": {"value": {"time": "+2014-00-00T00:00:00Z"}}}]}}]"#,
+    );
+    // Year-only dates widen to cover the whole year on each side.
+    assert_eq!(
+        crate::sources::wikidata::tenure_of(&closed, "Q1"),
+        Some(span(Some("20100101"), Some("20141231")))
+    );
+
+    // A claim with no dates at all says nothing about when.
+    let undated = entity(r#"[{"qualifiers": {}}]"#);
+    assert_eq!(crate::sources::wikidata::tenure_of(&undated, "Q1"), None);
+    assert_eq!(crate::sources::wikidata::tenure_of(&entity("[]"), "Q1"), None);
+}
+
+#[test]
+fn the_window_is_the_users_bounds_narrowed_to_the_tenure() {
+    let tenure = span(Some("20201010"), Some("20250101"));
+    // No user bounds: the tenure is the window.
+    assert_eq!(expand::resolve_window(None, None, Some(&tenure)), tenure);
+    // User bounds inside the tenure win; bounds outside it are cut back.
+    assert_eq!(
+        expand::resolve_window(Some("20220101"), Some("20230101"), Some(&tenure)),
+        span(Some("20220101"), Some("20230101"))
+    );
+    assert_eq!(
+        expand::resolve_window(Some("20000101"), Some("20300101"), Some(&tenure)),
+        tenure
+    );
+    // No tenure known: the user's bounds, untouched.
+    assert_eq!(
+        expand::resolve_window(Some("20220101"), None, None),
+        span(Some("20220101"), None)
+    );
+    // Disjoint: the user asked for those dates, so an empty window loses.
+    assert_eq!(
+        expand::resolve_window(Some("19900101"), Some("19950101"), Some(&tenure)),
+        span(Some("19900101"), Some("19950101"))
+    );
+}
+
+#[test]
+fn names_differing_by_accent_are_one_name_and_each_script_gets_a_turn() {
+    let aliases = names(&[
+        "Šadyr Japarov", // the query again, once the accent folds
+        "SADYR JAPAROV",
+        "Садыр Жапаров",
+        "Sadyr Zhaparov",
+        "صادیر جاپاروف",
+        "Sadyr Nurgozhoevich Zhaparov",
+    ]);
+    let w = Span::default();
+    let queries = expand::expand(&plan("Sadyr Japarov", &aliases, &w, 20));
+    let round0: Vec<&str> = queries.iter().take(4).map(|q| q.text.as_str()).collect();
+
+    assert_eq!(round0[0], "\"Sadyr Japarov\"");
+    // The Cyrillic form, then a further romanisation, then the Arabic-script one.
+    assert_eq!(round0[1], "\"Садыр Жапаров\"");
+    assert_eq!(round0[2], "\"Sadyr Zhaparov\"");
+    assert_eq!(round0[3], "\"صادیر جاپاروف\"");
+    // "Šadyr" and "SADYR" fold to the query itself and add nothing.
+    assert!(!queries.iter().any(|q| q.text.contains("Šadyr") || q.text.contains("SADYR")));
+}
+
+#[test]
+fn expansion_is_bounded_deduplicated_and_carries_the_place() {
+    let aliases = names(&["Садыр Жапаров"]);
+    let w = span(Some("20201010"), Some("20260101"));
+    let mut p = plan("Sadyr Japarov", &aliases, &w, 6);
+    p.place = Some("Turkey");
+
+    let queries = expand::expand(&p);
+    assert_eq!(queries.len(), 6, "never more than asked for");
+    assert!(queries.iter().all(|q| q.text.ends_with("Turkey")));
+    let mut seen = std::collections::HashSet::new();
+    assert!(
+        queries.iter().all(|q| seen.insert((q.text.clone(), q.since.clone(), q.until.clone()))),
+        "no query twice"
+    );
+    // Multi-word predicates are matched as phrases.
+    let all: String = queries.iter().map(|q| q.text.clone()).collect::<Vec<_>>().join("|");
+    assert!(all.contains("\"Sadyr Japarov\" visit Turkey"), "got {all}");
+}
+
+#[test]
+fn year_slices_tile_the_window_exactly_with_no_gap_or_overlap() {
+    let w = span(Some("20201010"), Some("20260315"));
+    let queries = expand::expand(&plan("Japarov", &[], &w, 12));
+    // The slices are the ones that are narrower than the whole window.
+    let slices: Vec<(&str, &str)> = queries
+        .iter()
+        .filter_map(|q| Some((q.since.as_deref()?, q.until.as_deref()?)))
+        .filter(|&(s, u)| (s, u) != ("20201010", "20260315"))
+        .collect();
+    assert!(slices.len() >= 2, "got {slices:?}");
+
+    // Starts on the window's exact start, ends on its exact end, and each slice
+    // begins the day after the previous one ended.
+    assert_eq!(slices.first().unwrap().0, "20201010");
+    assert_eq!(slices.last().unwrap().1, "20260315");
+    for pair in slices.windows(2) {
+        let prev_year: i32 = pair[0].1[..4].parse().unwrap();
+        assert_eq!(pair[0].1, format!("{prev_year}1231"));
+        assert_eq!(pair[1].0, format!("{}0101", prev_year + 1));
+    }
+}
+
+#[test]
+fn an_open_window_slices_up_to_this_year_and_stays_open() {
+    let w = span(Some("20240101"), None);
+    let queries = expand::expand(&plan("Japarov", &[], &w, 10));
+    let last_slice = queries
+        .iter()
+        .rev()
+        .find(|q| q.since.as_deref().is_some_and(|s| s != "20240101") && q.until.is_none());
+    // The final slice reaches the present and has no end date to invent.
+    assert!(last_slice.is_some(), "got {queries:?}");
+}
+
+#[test]
+fn a_query_that_already_has_syntax_is_not_requoted() {
+    let w = Span::default();
+    let queries = expand::expand(&plan("Japarov sourcelang:russian", &[], &w, 3));
+    assert_eq!(queries[0].text, "Japarov sourcelang:russian");
+    let queries = expand::expand(&plan("\"state visit\" Turkey", &[], &w, 3));
+    assert_eq!(queries[0].text, "\"state visit\" Turkey");
+}
+
+/// Answers every query and remembers the text of each, to see what a round
+/// actually asked.
+#[derive(Debug)]
+struct Recorder {
+    name: &'static str,
+    asked: Arc<Mutex<Vec<String>>>,
+    fails_after: Option<usize>,
+    per_query: bool,
+    found: fn() -> Found,
+}
+
+#[async_trait::async_trait]
+impl DiscoverySource for Recorder {
+    fn name(&self) -> Arc<str> {
+        Arc::from(self.name)
+    }
+    fn per_query(&self) -> bool {
+        self.per_query
+    }
+    async fn discover(
+        &self,
+        _client: &reqwest::Client,
+        query: &Query,
+        _budget: &DiscoveryBudget,
+    ) -> Result<Found, CrawlError> {
+        let mut asked = self.asked.lock().unwrap();
+        asked.push(query.text.clone());
+        if self.fails_after.is_some_and(|n| asked.len() > n) {
+            return Err(CrawlError::Transport("rate limited".into()));
+        }
+        Ok((self.found)())
+    }
+}
+
+fn lead_for(name: &'static str, url: &str) -> Lead {
+    Lead {
+        url: canonicalize(url).unwrap(),
+        score: 0.5,
+        title: None,
+        seen: None,
+        domain: None,
+        language: None,
+        sources: vec![Arc::from(name)],
+    }
+}
+
+#[tokio::test]
+async fn research_expands_from_what_the_first_round_learned() {
+    let text_log = Arc::new(Mutex::new(Vec::new()));
+    let subject_log = Arc::new(Mutex::new(Vec::new()));
+    let sources: Vec<Box<dyn DiscoverySource>> = vec![
+        Box::new(Recorder {
+            name: "news",
+            asked: Arc::clone(&text_log),
+            fails_after: None,
+            per_query: true,
+            found: || Found::leads(vec![lead_for("news", "https://example.org/story")]),
+        }),
+        Box::new(Recorder {
+            name: "entity",
+            asked: Arc::clone(&subject_log),
+            fails_after: None,
+            per_query: false,
+            found: || Found {
+                leads: vec![lead_for("entity", "https://example.org/profile")],
+                terms: vec!["Садыр Жапаров".to_string()],
+                span: Some(Span { from: Some("20201010".into()), to: Some("20260101".into()) }),
+            },
+        }),
+    ];
+    let base = Query { text: "Sadyr Japarov".into(), since: None, until: None, sites: vec![] };
+
+    let done = expand::research(
+        &test_client(),
+        &sources,
+        &base,
+        Some("Turkey"),
+        6,
+        &DiscoveryBudget::default(),
+    )
+    .await;
+
+    // The tenure the entity source reported became the window.
+    assert_eq!(done.window, span(Some("20201010"), Some("20260101")));
+    // The native-script name it learned was searched.
+    assert!(done.queries.iter().any(|q| q.text.contains("Садыр Жапаров")));
+    // The text search ran the original plus every expansion...
+    assert_eq!(text_log.lock().unwrap().len(), 1 + done.queries.len());
+    // ...and the entity lookup, whose answer does not depend on wording, once.
+    assert_eq!(subject_log.lock().unwrap().len(), 1);
+    // Both sources' leads survive the merge.
+    assert_eq!(done.federated.leads.len(), 2);
+}
+
+#[tokio::test]
+async fn research_stops_asking_a_source_that_has_started_failing() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let sources: Vec<Box<dyn DiscoverySource>> = vec![Box::new(Recorder {
+        name: "limited",
+        asked: Arc::clone(&log),
+        fails_after: Some(1),
+        per_query: true,
+        found: || Found::leads(vec![lead_for("limited", "https://example.org/a")]),
+    })];
+    let base = Query { text: "Japarov".into(), since: None, until: None, sites: vec![] };
+
+    let done = expand::research(&test_client(), &sources, &base, None, 8, &DiscoveryBudget::default())
+        .await;
+
+    // The base round worked, the first expansion was refused, and that was the
+    // last request: eight more would only deepen a rate limit.
+    assert_eq!(log.lock().unwrap().len(), 2);
+    assert_eq!(done.federated.failures.len(), 1);
+    assert_eq!(done.federated.leads.len(), 1, "what it returned before failing is kept");
+}
+
+// *** near-duplicates ***
+
+const WORDS: &[&str] = &[
+    "president", "visit", "ankara", "talks", "trade", "energy", "border", "minister", "signed",
+    "agreement", "delegation", "summit", "bishkek", "cooperation", "security", "water", "gold",
+    "railway", "council", "meeting", "parliament", "reform", "budget", "election", "policy",
+    "region", "forum", "accord", "treaty", "envoy", "capital", "airport", "ceremony", "press",
+];
+
+/// A long article from a fixed seed: the same words every run, so a failing
+/// distance is a real change in behaviour and not a bad draw.
+fn article(seed: u64, words: usize) -> String {
+    let mut state = seed;
+    (0..words)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            WORDS[(state >> 33) as usize % WORDS.len()]
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn a_syndicated_copy_with_different_chrome_is_the_same_story() {
+    let story = article(7, 300);
+    let copy = format!("Share on X Subscribe now Menu {story} Related articles Terms of use Contact us");
+    let (a, b) = (dedup::fingerprint(&story).unwrap(), dedup::fingerprint(&copy).unwrap());
+    assert!(dedup::distance(a, b) <= dedup::SAME_STORY, "distance {}", dedup::distance(a, b));
+}
+
+#[test]
+fn a_different_story_of_the_same_length_is_not() {
+    let a = dedup::fingerprint(&article(7, 300)).unwrap();
+    let b = dedup::fingerprint(&article(99, 300)).unwrap();
+    assert!(dedup::distance(a, b) > 10, "distance {}", dedup::distance(a, b));
+}
+
+#[test]
+fn short_text_is_never_fingerprinted_so_error_pages_do_not_cluster() {
+    assert_eq!(dedup::fingerprint("Page not found. Return to the homepage."), None);
+    assert_eq!(dedup::fingerprint(""), None);
+}
+
+#[test]
+fn text_without_spaces_still_fingerprints() {
+    // Chinese has no word boundaries: shingling by word would see one word.
+    let text = "总统对安卡拉进行了正式访问并与土耳其领导人举行了会谈双方签署了多项合作协议".repeat(8);
+    let other = "地震发生在山区造成多处房屋倒塌救援人员已经赶往现场开展搜救工作".repeat(8);
+    let (a, b) = (dedup::fingerprint(&text).unwrap(), dedup::fingerprint(&other).unwrap());
+    assert!(dedup::distance(a, b) > dedup::SAME_STORY);
+    assert_eq!(dedup::distance(a, dedup::fingerprint(&text).unwrap()), 0);
+}
+
+#[test]
+fn clusters_compare_to_the_first_member_so_drift_cannot_chain() {
+    let (a, b, c) = (0u64, 0b111, 0b111111);
+    // b is 3 from a, c is 3 from b but 6 from a: chaining would join all
+    // three; a cluster is a claim about similarity to its lead.
+    let groups = dedup::cluster(&[Some(a), Some(b), Some(c)], 3);
+    assert_eq!(groups, vec![vec![0, 1], vec![2]]);
+    // No fingerprint, no cluster: each stands alone, even next to a twin.
+    let groups = dedup::cluster(&[None, None, Some(a), Some(a)], 3);
+    assert_eq!(groups, vec![vec![0], vec![1], vec![2, 3]]);
+}
+
+fn page(url: &str, body: &str, relevance: f32) -> FetchedPage {
+    FetchedPage {
+        url: Url::parse(url).unwrap(),
+        html: format!("<html><body><main>{body}</main></body></html>"),
+        origin: Origin::Seed,
+        relevance,
+    }
+}
+
+#[test]
+fn the_most_relevant_copy_is_shown_and_the_rest_are_counted() {
+    let story = article(7, 300);
+    let pages = vec![
+        page("https://a.example/one", &story, 0.2),
+        page("https://b.example/one", &format!("Menu {story} Footer"), 0.9),
+        page("https://c.example/other", &article(99, 300), 0.5),
+        page("https://d.example/one", &story, 0.9),
+    ];
+    let groups = dedup::group_pages(&pages);
+    assert_eq!(groups.len(), 2);
+    // 0.9 twice: the earlier fetch wins the tie.
+    assert_eq!(groups[0], dedup::Group { best: 1, copies: vec![0, 3] });
+    assert_eq!(groups[1], dedup::Group { best: 2, copies: vec![] });
+}
+
+#[test]
+fn the_report_says_how_many_distinct_stories_there_were() {
+    let story = article(7, 300);
+    let outcome = CrawlOutcome {
+        pages: vec![
+            page("https://a.example/one", &story, 0.4),
+            page("https://b.example/one", &story, 0.4),
+            page("https://b.example/two", &story, 0.4),
+            page("https://c.example/other", &article(99, 300), 0.4),
+        ],
+        failed: vec![],
+        robots_skipped: 0,
+        budget_hit: false,
+    };
+    let text = crate::tools::report(&outcome);
+    assert!(text.contains("Fetched 4 page(s); 2 distinct after collapsing 2 near-duplicate copies"), "{text}");
+    // Both copies are on one host: named once, and nothing is left over.
+    assert!(text.contains("https://a.example/one — also on b.example\n"), "{text}");
+    // Only one line per story is listed.
+    assert!(!text.contains("https://b.example/two"), "{text}");
 }

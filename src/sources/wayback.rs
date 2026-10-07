@@ -79,6 +79,10 @@ impl DiscoverySource for Wayback {
         Arc::from("wayback")
     }
 
+    fn per_query(&self) -> bool {
+        false
+    }
+
     async fn discover(
         &self,
         client: &Client,

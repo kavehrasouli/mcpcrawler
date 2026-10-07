@@ -19,7 +19,7 @@
 
 use crate::api::fetch_json;
 use crate::crawler::{CrawlError, canonicalize};
-use crate::discovery::{DiscoveryBudget, DiscoverySource, Found, Lead, Query};
+use crate::discovery::{DiscoveryBudget, DiscoverySource, Found, Lead, Query, Span};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
@@ -31,6 +31,11 @@ const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Requests this source needs before it can answer at all.
 const REQUESTS_NEEDED: usize = 2;
+
+/// `P39`, position held — with `P580` and `P582` as the qualifiers for when.
+const POSITION_HELD: &str = "P39";
+const START_TIME: &str = "P580";
+const END_TIME: &str = "P582";
 
 /// `P856`, official website.
 const OFFICIAL_WEBSITE: &str = "P856";
@@ -99,6 +104,10 @@ impl DiscoverySource for Wikidata {
         Arc::from("wikidata")
     }
 
+    fn per_query(&self) -> bool {
+        false
+    }
+
     async fn discover(
         &self,
         client: &Client,
@@ -122,6 +131,7 @@ impl DiscoverySource for Wikidata {
         Ok(Found {
             leads: leads_from(&entity, &id, self.name()),
             terms: names_of(&entity, &id),
+            span: tenure_of(&entity, &id),
         })
     }
 }
@@ -239,4 +249,73 @@ fn names_of(response: &Value, id: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// When the entity held office: the earliest start and the latest end across
+/// every `P39` claim.
+///
+/// One claim without an end date is a post still held, and that leaves the
+/// span open at the far end rather than closed at the last date on record. A
+/// subject with several posts gets the union of them, which is wider than any
+/// one post — a deliberate trade, since a window that is too narrow loses
+/// coverage silently and one that is too wide only costs a few queries.
+pub(crate) fn tenure_of(response: &Value, id: &str) -> Option<Span> {
+    let entity = response.get("entities").and_then(|e| e.get(id))?;
+    let claims = entity.get("claims")?.get(POSITION_HELD)?.as_array()?;
+    if claims.is_empty() {
+        return None;
+    }
+
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut ongoing = false;
+    for claim in claims {
+        let qualifier = |property: &str| -> Option<&str> {
+            claim
+                .get("qualifiers")?
+                .get(property)?
+                .as_array()?
+                .first()?
+                .get("datavalue")?
+                .get("value")?
+                .get("time")?
+                .as_str()
+        };
+        if let Some(start) = qualifier(START_TIME).and_then(|t| date_of(t, false)) {
+            from = Some(from.map_or(start.clone(), |f| f.min(start)));
+        }
+        match qualifier(END_TIME).and_then(|t| date_of(t, true)) {
+            Some(end) => to = Some(to.map_or(end.clone(), |t| t.max(end))),
+            None => ongoing = true,
+        }
+    }
+    if from.is_none() && to.is_none() {
+        return None;
+    }
+    Some(Span { from, to: if ongoing { None } else { to } })
+}
+
+/// `+2021-01-28T00:00:00Z` -> `20210128`. Wikidata marks a date known only to
+/// the month or the year with zeros (`+2021-00-00`), which is widened to the
+/// whole month or year so the window never excludes a day it might contain.
+/// Dates before year 1 or with a malformed shape give `None`.
+fn date_of(time: &str, end_of_period: bool) -> Option<String> {
+    let date = time.strip_prefix('+')?.split('T').next()?;
+    let mut parts = date.split('-');
+    let (year, month, day) = (parts.next()?, parts.next()?, parts.next()?);
+    if year.len() != 4 || !year.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let month = match (month, end_of_period) {
+        ("00", false) => "01",
+        ("00", true) => "12",
+        (m, _) => m,
+    };
+    let day = match (day, end_of_period) {
+        ("00", false) => "01",
+        ("00", true) => "31",
+        (d, _) => d,
+    };
+    let all_digits = |s: &str| s.len() == 2 && s.chars().all(|c| c.is_ascii_digit());
+    (all_digits(month) && all_digits(day)).then(|| format!("{year}{month}{day}"))
 }

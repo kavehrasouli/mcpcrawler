@@ -12,6 +12,8 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use crate::discovery::{DiscoveryBudget, DiscoverySource, Federated, Query, federate};
+use crate::dedup::{self, Group};
+use crate::expand;
 use crate::scoring::Terms;
 use crate::sitemap::{self, SitemapConfig};
 use crate::sources::{brave::Brave, gdelt::Gdelt, wayback::Wayback, wikidata::Wikidata};
@@ -80,6 +82,39 @@ fn built_in_sources() -> Vec<Box<dyn DiscoverySource>> {
         sources.push(Box::new(brave));
     }
     sources
+}
+
+/// One discovery round, expanded or not, with a line saying what was run.
+///
+/// Expansion is opt-in and says what it did: a result list that silently came
+/// from eight queries over a narrowed window reads as if it came from the one
+/// the caller typed.
+async fn run_discovery(
+    client: &reqwest::Client,
+    sources: &[Box<dyn DiscoverySource>],
+    input: &DiscoverInput,
+) -> Result<(Federated, String), String> {
+    let query = input.window()?;
+    let budget = input.budget();
+    if input.expand != Some(true) {
+        return Ok((federate(client, sources, &query, &budget).await, String::new()));
+    }
+
+    let max = input.max_queries.unwrap_or(expand::DEFAULT_QUERIES);
+    let done = expand::research(client, sources, &query, input.place.as_deref(), max, &budget).await;
+    let bound = |d: &Option<String>| d.clone().unwrap_or_else(|| "open".to_string());
+    let mut note = format!(
+        "Expanded: {} more quer{} over {}–{}, plus the original.\n",
+        done.queries.len(),
+        if done.queries.len() == 1 { "y" } else { "ies" },
+        bound(&done.window.from),
+        bound(&done.window.to),
+    );
+    for q in &done.queries {
+        note.push_str(&format!("  - {} [{}–{}]\n", q.text, bound(&q.since), bound(&q.until)));
+    }
+    note.push('\n');
+    Ok((done.federated, note))
 }
 
 fn discovery_report(outcome: &Federated) -> String {
@@ -165,7 +200,37 @@ fn structured_report(data: &StructuredData, base: &Url) -> String {
     out
 }
 
-fn report(outcome: &CrawlOutcome) -> String {
+/// ` — also on a.com, b.com (+3)`: the hosts carrying the same story, which is
+/// itself the evidence that it was syndicated.
+fn copies_note(outcome: &CrawlOutcome, group: &Group) -> String {
+    if group.copies.is_empty() {
+        return String::new();
+    }
+    let mut hosts: Vec<&str> = Vec::new();
+    for copy in &group.copies {
+        if let Some(host) = outcome.pages[*copy].url.host_str()
+            && !hosts.contains(&host)
+        {
+            hosts.push(host);
+        }
+    }
+    let shown = hosts.len().min(3);
+    // Copies not accounted for by a named host, which may be several per host.
+    let more = group
+        .copies
+        .iter()
+        .filter(|c| {
+            outcome.pages[**c].url.host_str().is_none_or(|h| !hosts[..shown].contains(&h))
+        })
+        .count();
+    let mut note = format!(" — also on {}", hosts[..shown].join(", "));
+    if more > 0 {
+        note.push_str(&format!(" (+{more})"));
+    }
+    note
+}
+
+pub(crate) fn report(outcome: &CrawlOutcome) -> String {
     let urls = outcome.urls();
     let focused = outcome.pages.iter().any(|p| p.relevance > 0.0);
     // Where the URLs came from, not which URL came from where: naming the
@@ -182,8 +247,20 @@ fn report(outcome: &CrawlOutcome) -> String {
         ),
     };
 
+    // One story syndicated onto fifty sites is one report, not fifty.
+    let groups = dedup::group_pages(&outcome.pages);
+    let copies: usize = groups.iter().map(|g| g.copies.len()).sum();
+    let distinct = match copies {
+        0 => String::new(),
+        n => format!(
+            " {} distinct after collapsing {n} near-duplicate cop{}.",
+            groups.len(),
+            if n == 1 { "y" } else { "ies" }
+        ),
+    };
+
     let mut out = format!(
-        "Fetched {} page(s); {} failed; {} skipped by robots.txt.{}{}\n\n",
+        "Fetched {} page(s);{distinct} {} failed; {} skipped by robots.txt.{}{}\n\n",
         urls.len(),
         outcome.failed.len(),
         outcome.robots_skipped,
@@ -195,25 +272,26 @@ fn report(outcome: &CrawlOutcome) -> String {
         origins
     );
 
+    // Best first for a focused crawl: the relevant pages are the answer, and
+    // the order they happened to be fetched in is not interesting.
+    let mut shown: Vec<&Group> = groups.iter().collect();
     if focused {
-        // Best first. For a focused crawl the relevant pages are the answer,
-        // and the order they happened to be fetched in is not interesting.
-        let mut ranked: Vec<(f32, &str)> = outcome
-            .pages
-            .iter()
-            .map(|page| (page.relevance, page.url.as_str()))
-            .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-
-        let listed = ranked.len().min(MAX_LISTED);
-        for (relevance, url) in &ranked[..listed] {
-            out.push_str(&format!("[{relevance:.2}] {url}\n"));
+        shown.sort_by(|a, b| {
+            outcome.pages[b.best].relevance.total_cmp(&outcome.pages[a.best].relevance)
+        });
+    }
+    let listed = shown.len().min(MAX_LISTED);
+    for group in &shown[..listed] {
+        let page = &outcome.pages[group.best];
+        if focused {
+            out.push_str(&format!("[{:.2}] ", page.relevance));
         }
-        if ranked.len() > listed {
-            out.push_str(&format!("… and {} more (not listed)\n", ranked.len() - listed));
-        }
-    } else {
-        out.push_str(&list_urls(&urls));
+        out.push_str(page.url.as_str());
+        out.push_str(&copies_note(outcome, group));
+        out.push('\n');
+    }
+    if shown.len() > listed {
+        out.push_str(&format!("… and {} more (not listed)\n", shown.len() - listed));
     }
 
     if !outcome.failed.is_empty() {
@@ -382,6 +460,20 @@ pub struct DiscoverInput {
     )]
     #[serde(default)]
     pub sites: Option<Vec<String>>,
+    #[schemars(
+        description = "Search for the subject under its other names and across the years of its \
+                       term, not just the query as typed. Best with a person's name: their \
+                       aliases, native-script names and term dates come from Wikidata. Slower — \
+                       the news index answers one request every five seconds. Default false."
+    )]
+    #[serde(default)]
+    pub expand: Option<bool>,
+    #[schemars(description = "With expand: a place the subject's activity is about, added to every variant.")]
+    #[serde(default)]
+    pub place: Option<String>,
+    #[schemars(description = "With expand: how many query variants to run. Default 8, max 20.")]
+    #[serde(default)]
+    pub max_queries: Option<usize>,
 }
 
 impl DiscoverInput {
@@ -439,6 +531,15 @@ pub struct ResearchInput {
     )]
     #[serde(default)]
     pub depth: Option<u32>,
+    #[schemars(description = "Search under the subject's other names and across its term, as in discover. Default false.")]
+    #[serde(default)]
+    pub expand: Option<bool>,
+    #[schemars(description = "With expand: a place the subject's activity is about.")]
+    #[serde(default)]
+    pub place: Option<String>,
+    #[schemars(description = "With expand: how many query variants to run. Default 8, max 20.")]
+    #[serde(default)]
+    pub max_queries: Option<usize>,
 }
 
 impl ResearchInput {
@@ -449,6 +550,9 @@ impl ResearchInput {
             until: self.until.clone(),
             max_results: self.max_results,
             sites: self.sites.clone(),
+            expand: self.expand,
+            place: self.place.clone(),
+            max_queries: self.max_queries,
         }
     }
 
@@ -663,12 +767,11 @@ impl Crawler {
                        crawl_site."
     )]
     async fn discover(&self, Parameters(input): Parameters<DiscoverInput>) -> String {
-        let query = match input.window() {
-            Ok(query) => query,
+        let (outcome, note) = match run_discovery(&self.client, &self.sources, &input).await {
+            Ok(done) => done,
             Err(e) => return e,
         };
-        let outcome = federate(&self.client, &self.sources, &query, &input.budget()).await;
-        cap(discovery_report(&outcome))
+        cap(format!("{note}{}", discovery_report(&outcome)))
     }
 
     #[tool(
@@ -679,12 +782,10 @@ impl Crawler {
     )]
     async fn discover_and_crawl(&self, Parameters(input): Parameters<ResearchInput>) -> String {
         let discovery = input.discovery();
-        let query = match discovery.window() {
-            Ok(query) => query,
+        let (outcome, note) = match run_discovery(&self.client, &self.sources, &discovery).await {
+            Ok(done) => done,
             Err(e) => return e,
         };
-
-        let outcome = federate(&self.client, &self.sources, &query, &discovery.budget()).await;
         let failures = outcome.failures.clone();
 
         // The query, plus every name discovery learned for the same subject.
@@ -703,11 +804,12 @@ impl Crawler {
         let found = seeds.len();
         match crawl_from(&self.client, seeds, &input.config(focus)).await {
             Ok(crawled) => {
-                let mut out = format!(
+                let mut out = note;
+                out.push_str(&format!(
                     "{found} candidate(s) discovered; scoring links against {} name(s) for the \
                      subject.\n",
                     aliases + 1
-                );
+                ));
                 for (name, why) in &failures {
                     out.push_str(&format!("{name} failed: {why}\n"));
                 }

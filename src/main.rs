@@ -1,6 +1,8 @@
 mod api;
 mod crawler;
+mod dedup;
 mod discovery;
+mod expand;
 mod net;
 mod passmanager;
 mod scoring;

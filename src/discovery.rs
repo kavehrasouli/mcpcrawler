@@ -115,6 +115,14 @@ impl Lead {
     }
 }
 
+/// A stretch of time as inclusive `YYYYMMDD` bounds. `None` is open: no known
+/// start, or — for `to` — still ongoing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Span {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
 /// What a source found: candidate URLs, and any further names for the subject
 /// it learned on the way.
 #[derive(Debug, Default)]
@@ -128,11 +136,15 @@ pub struct Found {
     /// subject's own language at zero, which is most of the coverage that
     /// exists for a non-anglophone subject.
     pub terms: Vec<String>,
+    /// When the subject held the office the query is about, if a source knew.
+    /// It bounds every later query, so budget is not spent on years the
+    /// subject was not in post.
+    pub span: Option<Span>,
 }
 
 impl Found {
     pub fn leads(leads: Vec<Lead>) -> Self {
-        Self { leads, terms: Vec::new() }
+        Self { leads, terms: Vec::new(), span: None }
     }
 }
 
@@ -145,6 +157,16 @@ pub trait DiscoverySource: Debug + Send + Sync {
     /// Stable identifier. It becomes `Origin::Source(name)` on every URL this
     /// source contributes, so it ends up in crawl reports — keep it short.
     fn name(&self) -> Arc<str>;
+
+    /// Whether a different query text gets different results from this source.
+    ///
+    /// Query expansion reruns the text-searching backends once per variant. A
+    /// source that answers the same whatever the wording — Wikidata resolves
+    /// one entity, Wayback lists one site's captures — would only repeat
+    /// itself, so it runs once, on the original query.
+    fn per_query(&self) -> bool {
+        true
+    }
 
     async fn discover(
         &self,
@@ -162,6 +184,8 @@ pub struct Federated {
     /// Every name the round learned for the subject, deduplicated. What the
     /// crawler's link scoring is given to match against.
     pub terms: Vec<String>,
+    /// The first tenure any source reported.
+    pub span: Option<Span>,
     /// Sources that failed, and why. A round does not fail because one backend
     /// is down — it reports the gap and returns what the others found.
     pub failures: Vec<(String, String)>,
@@ -180,6 +204,16 @@ pub async fn federate(
     query: &Query,
     budget: &DiscoveryBudget,
 ) -> Federated {
+    let refs: Vec<&dyn DiscoverySource> = sources.iter().map(|s| s.as_ref()).collect();
+    federate_refs(client, &refs, query, budget).await
+}
+
+pub(crate) async fn federate_refs(
+    client: &Client,
+    sources: &[&dyn DiscoverySource],
+    query: &Query,
+    budget: &DiscoveryBudget,
+) -> Federated {
     let rounds = sources.iter().map(|source| async move {
         let name = source.name();
         // Per source, so a backend that hangs costs only its own results.
@@ -192,6 +226,7 @@ pub async fn federate(
 
     let mut found: Vec<Lead> = Vec::new();
     let mut terms: Vec<String> = Vec::new();
+    let mut span: Option<Span> = None;
     let mut failures = Vec::new();
     for (name, result) in join_all(rounds).await {
         match result {
@@ -202,12 +237,13 @@ pub async fn federate(
                         terms.push(term);
                     }
                 }
+                span = span.or(answer.span);
             }
             Err(why) => failures.push((name.to_string(), why)),
         }
     }
 
-    Federated { leads: merge(found, budget.max_candidates), terms, failures }
+    Federated { leads: merge(found, budget.max_candidates), terms, span, failures }
 }
 
 /// Collapse duplicate URLs, keeping every source that found one.
@@ -216,7 +252,7 @@ pub async fn federate(
 /// relevant because two backends agree, it is more *corroborated*, and those
 /// are different claims. The corroboration is recorded in `sources` for the
 /// stage that knows what to do with it.
-fn merge(leads: Vec<Lead>, max_candidates: usize) -> Vec<Lead> {
+pub(crate) fn merge(leads: Vec<Lead>, max_candidates: usize) -> Vec<Lead> {
     let mut by_url: HashMap<String, Lead> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
 
