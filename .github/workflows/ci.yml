@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build, lint, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release --locked
+      # Warnings are errors: an unused item is usually a half-finished change.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      # The suite is hermetic — a local fixture server, no network.
+      - name: Test
+        run: cargo test --release --locked
+
+  # The declared minimum Rust version is checked, not just stated.
+  msrv:
+    name: minimum supported Rust (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  supply-chain:
+    name: advisories, licences, sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  # Needs a real Chrome. It is allowed to fail while sandboxing on hosted
+  # runners is sorted out; run locally with
+  #   cargo test --release -- --ignored browser
+  browser:
+    name: headless browser (ignored tests)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: browser-actions/setup-chrome@v1
+      - run: cargo test --release --locked -- --ignored browser
