@@ -2,11 +2,13 @@
 name            = "mcpcrawler"
 version         = "0.1.0"
 edition         = "2024"
+# Edition 2024 needs 1.85; `if let … && let …` chains, used throughout, need 1.88.
+rust-version    = "1.88"
 
 [dependencies]
 tokio           = {version = "1", features = ["full"]}
 reqwest         = {version = "0.12", features = ["native-tls"]}
-scraper         = "0.22"
+scraper         = "0.27"
 url             = "2"
 rmcp            = { version = "3.2.0", features = ["server", "client"] }
 serde           = {version = "1", features = ["derive"]}
@@ -15,7 +17,7 @@ futures         = "0.3"
 htmd            = "0.1"
 texting_robots = "0.2.2"
 chromiumoxide = { version = "0.9", default-features = false, features = ["bytes"] }
-ego-tree = "0.10"
+ego-tree = "0.11"
 quick-xml = "0.42.0"
 flate2 = "1.1.9"
 async-trait = "0.1.92"
