@@ -45,6 +45,11 @@ pub struct Query {
     /// claim is one way to fill this; the domains of an earlier round's
     /// results are another.
     pub sites: Vec<String>,
+    /// Which of the subject's posts the question is about, as a word or phrase
+    /// from the post's English name ("president"). A person who held several
+    /// offices has one term for each; this picks the one that bounds the
+    /// search. Without it the window is the union of all of them.
+    pub post: Option<String>,
 }
 
 impl Query {
@@ -89,8 +94,12 @@ impl Default for DiscoveryBudget {
 #[derive(Debug, Clone)]
 pub struct Lead {
     pub url: Url,
-    /// Higher is more promising, on an arbitrary scale each source sets for
-    /// itself. Comparable within a source; only roughly comparable across them.
+    /// Higher is more promising. Within a source it is that source's own
+    /// ranking; across sources it is *relative*: the federation rescales each
+    /// source's answers so its best is 1.0 and its worst is 0.1, because the
+    /// raw numbers are not comparable (GDELT scores by rank, Wikidata by kind
+    /// of page). A 1.0 therefore means "this source's top pick", not "certainly
+    /// relevant" — which is the only claim the sources can honestly share.
     pub score: f32,
     pub title: Option<String>,
     /// When the source saw it, in whatever format the source reports.
@@ -140,11 +149,15 @@ pub struct Found {
     /// It bounds every later query, so budget is not spent on years the
     /// subject was not in post.
     pub span: Option<Span>,
+    /// Who the query was resolved to, when it named an office and not a person:
+    /// "President of Kyrgyzstan" is a description, and the person who holds it
+    /// is what gets searched for.
+    pub subject: Option<String>,
 }
 
 impl Found {
     pub fn leads(leads: Vec<Lead>) -> Self {
-        Self { leads, terms: Vec::new(), span: None }
+        Self { leads, terms: Vec::new(), span: None, subject: None }
     }
 }
 
@@ -186,6 +199,8 @@ pub struct Federated {
     pub terms: Vec<String>,
     /// The first tenure any source reported.
     pub span: Option<Span>,
+    /// Who an office in the query was resolved to, if any source did.
+    pub subject: Option<String>,
     /// Sources that failed, and why. A round does not fail because one backend
     /// is down — it reports the gap and returns what the others found.
     pub failures: Vec<(String, String)>,
@@ -208,6 +223,39 @@ pub async fn federate(
     federate_refs(client, &refs, query, budget).await
 }
 
+/// Sources that could not be reached, and when to try them again.
+///
+/// A host that does not answer costs the full connect timeout on every call,
+/// several times over once retries are counted, and tells the caller the same
+/// thing each time. After a connection-level failure a source is skipped for a
+/// short while, and the skip says so and says for how long. Only connection
+/// failures count: a bad response or a rate-limit notice says the host is up.
+static COOLDOWNS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How long an unreachable source is left alone.
+const COOLDOWN: Duration = Duration::from_secs(120);
+
+/// `reqwest` reports a failed connection as `client error (Connect)`.
+fn is_connection_failure(error: &CrawlError) -> bool {
+    matches!(error, CrawlError::Transport(message) if message.contains("(Connect)"))
+}
+
+fn cooling_down(name: &str) -> Option<Duration> {
+    let mut cooldowns = COOLDOWNS.lock().unwrap();
+    match cooldowns.get(name) {
+        Some(until) if *until > std::time::Instant::now() => {
+            Some(until.saturating_duration_since(std::time::Instant::now()))
+        }
+        Some(_) => {
+            cooldowns.remove(name);
+            None
+        }
+        None => None,
+    }
+}
+
 pub(crate) async fn federate_refs(
     client: &Client,
     sources: &[&dyn DiscoverySource],
@@ -216,10 +264,25 @@ pub(crate) async fn federate_refs(
 ) -> Federated {
     let rounds = sources.iter().map(|source| async move {
         let name = source.name();
+        if let Some(left) = cooling_down(&name) {
+            let why = format!(
+                "skipped: it could not be reached a moment ago; trying again in {}s",
+                left.as_secs() + 1
+            );
+            return (name, Err(why));
+        }
         // Per source, so a backend that hangs costs only its own results.
         match tokio::time::timeout(budget.deadline, source.discover(client, query, budget)).await {
             Ok(Ok(leads)) => (name, Ok(leads)),
-            Ok(Err(e)) => (name, Err(e.to_string())),
+            Ok(Err(e)) => {
+                if is_connection_failure(&e) {
+                    COOLDOWNS
+                        .lock()
+                        .unwrap()
+                        .insert(name.to_string(), std::time::Instant::now() + COOLDOWN);
+                }
+                (name, Err(e.to_string()))
+            }
             Err(_) => (name, Err(format!("timed out after {:?}", budget.deadline))),
         }
     });
@@ -227,23 +290,49 @@ pub(crate) async fn federate_refs(
     let mut found: Vec<Lead> = Vec::new();
     let mut terms: Vec<String> = Vec::new();
     let mut span: Option<Span> = None;
+    let mut subject: Option<String> = None;
     let mut failures = Vec::new();
+    crate::metrics::inc(&crate::metrics::DISCOVERY_ROUNDS);
     for (name, result) in join_all(rounds).await {
         match result {
             Ok(answer) => {
-                found.extend(answer.leads);
+                let mut leads = answer.leads;
+                rescale(&mut leads);
+                found.extend(leads);
                 for term in answer.terms {
                     if !terms.contains(&term) {
                         terms.push(term);
                     }
                 }
                 span = span.or(answer.span);
+                subject = subject.or(answer.subject);
             }
-            Err(why) => failures.push((name.to_string(), why)),
+            Err(why) => {
+                crate::metrics::inc(&crate::metrics::SOURCE_FAILURES);
+                crate::metrics::warn("source_failed", "discovery", &[("source", name.to_string())]);
+                failures.push((name.to_string(), why));
+            }
         }
     }
 
-    Federated { leads: merge(found, budget.max_candidates), terms, span, failures }
+    Federated { leads: merge(found, budget.max_candidates), terms, span, subject, failures }
+}
+
+/// Put one source's scores on the common scale: its best 1.0, its worst 0.1,
+/// the rest in proportion. A source whose answers all tie gets 1.0 across the
+/// board — it expressed no preference, and inventing one would be noise.
+fn rescale(leads: &mut [Lead]) {
+    let (Some(min), Some(max)) = (
+        leads.iter().map(|l| l.score).min_by(f32::total_cmp),
+        leads.iter().map(|l| l.score).max_by(f32::total_cmp),
+    ) else {
+        return;
+    };
+    for lead in leads {
+        let position = if max > min { (lead.score - min) / (max - min) } else { 1.0 };
+        // The top is exactly 1.0, not 0.1 + 0.9 rounded.
+        lead.score = if position >= 1.0 { 1.0 } else { 0.1 + 0.9 * position };
+    }
 }
 
 /// Collapse duplicate URLs, keeping every source that found one.

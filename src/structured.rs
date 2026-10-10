@@ -121,10 +121,10 @@ pub fn extract(html: &str) -> StructuredData {
         }
 
         for global in STATE_GLOBALS {
-            if let Some(raw) = assigned_json(&text, global) {
-                if let Ok(value) = serde_json::from_str::<Value>(raw) {
-                    push_state(global.to_string(), value, raw.len(), &mut embedded);
-                }
+            if let Some(raw) = assigned_json(&text, global)
+                && let Ok(value) = serde_json::from_str::<Value>(raw)
+            {
+                push_state(global.to_string(), value, raw.len(), &mut embedded);
             }
         }
     }
@@ -280,10 +280,10 @@ fn collect_urls(
     }
     match value {
         Value::String(s) => {
-            if let Some(url) = url_like(s, base) {
-                if seen.insert(dedup_key(&url)) {
-                    out.push(url);
-                }
+            if let Some(url) = url_like(s, base)
+                && seen.insert(dedup_key(&url))
+            {
+                out.push(url);
             }
         }
         Value::Array(items) => items

@@ -16,10 +16,17 @@
 //!   has never heard of.
 //!
 //! Two requests: one to resolve the name, one to read the entity.
+//!
+//! **An office is not a person.** "President of Kyrgyzstan" resolves to the
+//! *position*, which lists its officeholder and when they took up the post.
+//! When the name turns out to be a position, one more request reads the holder,
+//! and the person is what is searched for — with the window bounded by that
+//! holder's time in that office, not by their whole career.
 
 use crate::api::fetch_json;
 use crate::crawler::{CrawlError, canonicalize};
 use crate::discovery::{DiscoveryBudget, DiscoverySource, Found, Lead, Query, Span};
+use std::collections::HashSet;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
@@ -34,6 +41,14 @@ const REQUESTS_NEEDED: usize = 2;
 
 /// `P39`, position held — with `P580` and `P582` as the qualifiers for when.
 const POSITION_HELD: &str = "P39";
+/// `P1308`, officeholder: on a position, who holds it.
+const OFFICEHOLDER: &str = "P1308";
+/// `P31` and `Q4164871`: instance of "position".
+const INSTANCE_OF: &str = "P31";
+const POSITION_CLASS: &str = "Q4164871";
+/// An office's own pages rank below its holder's: they describe the post, and
+/// the holder's are about the person doing what the question asks about.
+const OFFICE_DISCOUNT: f32 = 0.8;
 const START_TIME: &str = "P580";
 const END_TIME: &str = "P582";
 
@@ -82,6 +97,18 @@ impl Wikidata {
         url
     }
 
+    /// English labels only, for a handful of entities at once.
+    fn labels_url(&self, ids: &[String]) -> Url {
+        let mut url = self.endpoint.clone();
+        url.query_pairs_mut()
+            .append_pair("action", "wbgetentities")
+            .append_pair("ids", &ids.join("|"))
+            .append_pair("format", "json")
+            .append_pair("props", "labels")
+            .append_pair("languages", "en");
+        url
+    }
+
     fn entity_url(&self, id: &str) -> Url {
         let mut url = self.endpoint.clone();
         url.query_pairs_mut()
@@ -125,17 +152,62 @@ impl DiscoverySource for Wikidata {
         }
 
         let found = fetch_json(client, &self.search_url(text), &[], MAX_BODY_BYTES).await?;
-        let Some(id) = first_entity_id(&found) else {
+        let Some(mut id) = first_entity_id(&found) else {
             // No entity by that name is an ordinary answer, not a failure.
             return Ok(Found::default());
         };
 
-        let entity = fetch_json(client, &self.entity_url(&id), &[], MAX_BODY_BYTES).await?;
-        Ok(Found {
-            leads: leads_from(&entity, &id, self.name()),
-            terms: names_of(&entity, &id),
-            span: tenure_of(&entity, &id),
-        })
+        let mut entity = fetch_json(client, &self.entity_url(&id), &[], MAX_BODY_BYTES).await?;
+        let mut requests = REQUESTS_NEEDED;
+        let mut office_leads: Vec<Lead> = Vec::new();
+        let mut held: Option<Span> = None;
+        let mut subject: Option<String> = None;
+
+        // The name was an office: read who holds it, and search for them.
+        if is_position(&entity, &id)
+            && requests < budget.max_requests
+            && let Some((holder, term)) = officeholder(&entity, &id)
+        {
+            office_leads = leads_from(&entity, &id, self.name())
+                .into_iter()
+                .map(|mut lead| {
+                    lead.score *= OFFICE_DISCOUNT;
+                    lead
+                })
+                .collect();
+            let person = fetch_json(client, &self.entity_url(&holder), &[], MAX_BODY_BYTES).await?;
+            requests += 1;
+            subject = Some(match label_of(&person, &holder) {
+                Some(label) => format!("{label} (Wikidata {holder})"),
+                None => format!("Wikidata {holder}"),
+            });
+            entity = person;
+            id = holder;
+            held = Some(term);
+        }
+
+        // A person with several posts: the one the question names.
+        let mut span = held;
+        if span.is_none() {
+            let wanted = match query.post.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(post) if requests < budget.max_requests => {
+                    let ids = position_ids(&entity, &id);
+                    if ids.is_empty() {
+                        None
+                    } else {
+                        let labels =
+                            fetch_json(client, &self.labels_url(&ids), &[], MAX_BODY_BYTES).await?;
+                        Some(posts_named(&labels, post))
+                    }
+                }
+                _ => None,
+            };
+            span = tenure_of_posts(&entity, &id, wanted.as_ref().filter(|w| !w.is_empty()));
+        }
+
+        let mut leads = leads_from(&entity, &id, self.name());
+        leads.extend(office_leads);
+        Ok(Found { leads, terms: names_of(&entity, &id), span, subject })
     }
 }
 
@@ -281,41 +353,169 @@ fn names_of(response: &Value, id: &str) -> Vec<String> {
 /// span open at the far end rather than closed at the last date on record. A
 /// subject with several posts gets the union of them, which is wider than any
 /// one post — a deliberate trade, since a window that is too narrow loses
-/// coverage silently and one that is too wide only costs a few queries.
+/// coverage silently and one that is too wide only costs a few queries. Naming
+/// the post (see [`tenure_of_posts`]) narrows it.
+#[cfg(test)]
 pub(crate) fn tenure_of(response: &Value, id: &str) -> Option<Span> {
+    tenure_of_posts(response, id, None)
+}
+
+/// As [`tenure_of`], counting only the claims for the posts in `wanted`
+/// (Wikidata Q-IDs). `None` counts them all.
+pub(crate) fn tenure_of_posts(
+    response: &Value,
+    id: &str,
+    wanted: Option<&HashSet<String>>,
+) -> Option<Span> {
     let entity = response.get("entities").and_then(|e| e.get(id))?;
     let claims = entity.get("claims")?.get(POSITION_HELD)?.as_array()?;
-    if claims.is_empty() {
-        return None;
-    }
 
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
     let mut ongoing = false;
+    let mut counted = 0;
     for claim in claims {
-        let qualifier = |property: &str| -> Option<&str> {
-            claim
-                .get("qualifiers")?
-                .get(property)?
-                .as_array()?
-                .first()?
-                .get("datavalue")?
-                .get("value")?
-                .get("time")?
-                .as_str()
-        };
-        if let Some(start) = qualifier(START_TIME).and_then(|t| date_of(t, false)) {
+        if let Some(wanted) = wanted
+            && !claim_value_id(claim).is_some_and(|post| wanted.contains(post))
+        {
+            continue;
+        }
+        counted += 1;
+        let (start, end) = dates_of(claim);
+        if let Some(start) = start {
             from = Some(from.map_or(start.clone(), |f| f.min(start)));
         }
-        match qualifier(END_TIME).and_then(|t| date_of(t, true)) {
+        match end {
             Some(end) => to = Some(to.map_or(end.clone(), |t| t.max(end))),
             None => ongoing = true,
         }
     }
-    if from.is_none() && to.is_none() {
+    if counted == 0 || (from.is_none() && to.is_none()) {
         return None;
     }
     Some(Span { from, to: if ongoing { None } else { to } })
+}
+
+/// The start and end of one claim, from its `P580` and `P582` qualifiers.
+fn dates_of(claim: &Value) -> (Option<String>, Option<String>) {
+    let qualifier = |property: &str| -> Option<&str> {
+        claim
+            .get("qualifiers")?
+            .get(property)?
+            .as_array()?
+            .first()?
+            .get("datavalue")?
+            .get("value")?
+            .get("time")?
+            .as_str()
+    };
+    (
+        qualifier(START_TIME).and_then(|t| date_of(t, false)),
+        qualifier(END_TIME).and_then(|t| date_of(t, true)),
+    )
+}
+
+/// The entity a claim points at, for claims whose value is another entity.
+fn claim_value_id(claim: &Value) -> Option<&str> {
+    claim.get("mainsnak")?.get("datavalue")?.get("value")?.get("id")?.as_str()
+}
+
+/// Every post the entity has held, once each.
+fn position_ids(response: &Value, id: &str) -> Vec<String> {
+    let Some(claims) = response
+        .get("entities")
+        .and_then(|e| e.get(id))
+        .and_then(|e| e.get("claims"))
+        .and_then(|c| c.get(POSITION_HELD))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for claim in claims {
+        if let Some(post) = claim_value_id(claim)
+            && !ids.iter().any(|seen| seen == post)
+        {
+            ids.push(post.to_string());
+        }
+    }
+    ids
+}
+
+/// The posts, among those labelled in `labels`, whose English name contains
+/// `post`. Case-insensitive.
+fn posts_named(labels: &Value, post: &str) -> HashSet<String> {
+    let needle = post.to_lowercase();
+    labels
+        .get("entities")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, entity)| {
+            entity
+                .get("labels")
+                .and_then(|l| l.get("en"))
+                .and_then(|l| l.get("value"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.to_lowercase().contains(&needle))
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Whether the entity is an office rather than a person: an instance of
+/// "position", or something that lists an officeholder and holds no posts.
+fn is_position(response: &Value, id: &str) -> bool {
+    let Some(claims) = response.get("entities").and_then(|e| e.get(id)).and_then(|e| e.get("claims"))
+    else {
+        return false;
+    };
+    let is_class = claims
+        .get(INSTANCE_OF)
+        .and_then(Value::as_array)
+        .is_some_and(|c| c.iter().any(|claim| claim_value_id(claim) == Some(POSITION_CLASS)));
+    is_class || (claims.get(OFFICEHOLDER).is_some() && claims.get(POSITION_HELD).is_none())
+}
+
+/// Who holds an office, and for how long: the holder with no end date, or
+/// failing that the one whose term ended last.
+fn officeholder(response: &Value, id: &str) -> Option<(String, Span)> {
+    let claims = response
+        .get("entities")?
+        .get(id)?
+        .get("claims")?
+        .get(OFFICEHOLDER)?
+        .as_array()?;
+    let mut best: Option<(String, Span)> = None;
+    for claim in claims {
+        let Some(holder) = claim_value_id(claim) else { continue };
+        let (from, to) = dates_of(claim);
+        let candidate = (holder.to_string(), Span { from, to });
+        best = Some(match best {
+            None => candidate,
+            Some(current) => {
+                // Still in post beats finished; later end beats earlier.
+                let better = match (&candidate.1.to, &current.1.to) {
+                    (None, Some(_)) => true,
+                    (Some(a), Some(b)) => a > b,
+                    _ => false,
+                };
+                if better { candidate } else { current }
+            }
+        });
+    }
+    best
+}
+
+fn label_of(response: &Value, id: &str) -> Option<String> {
+    response
+        .get("entities")?
+        .get(id)?
+        .get("labels")?
+        .get("en")?
+        .get("value")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// `+2021-01-28T00:00:00Z` -> `20210128`. Wikidata marks a date known only to

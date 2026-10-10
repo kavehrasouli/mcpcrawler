@@ -10,11 +10,19 @@
 //! `Query` values and makes no request. [`research`] is the part that runs
 //! them.
 //!
-//! **What it does not do.** The predicate words ("state visit", "trip to") are
-//! English: translating them well is a per-language job that a table written
-//! here would get subtly wrong. Language coverage comes from the *names*
-//! instead — native-script aliases from Wikidata match the subject's own press
-//! whatever the verb.
+//! **Languages.** A name written in a non-Latin script is paired with the verbs
+//! of that script's main language (see [`native_predicates`]) instead of the
+//! English ones, because the press that writes the name in Cyrillic writes the
+//! rest of the sentence in Russian. Those words are a short, deliberately
+//! plain list — "visit", "official visit", "talks" — and are the author's
+//! translations, not reviewed by a speaker of each language. A script is not a
+//! language (Cyrillic is also Kyrgyz, Ukrainian, Bulgarian), so this is a
+//! best guess at the commonest one, and Latin-script names in French, Turkish
+//! or Spanish press get the English verbs only.
+//!
+//! **Spellings.** Wikidata lists the romanisations people have recorded.
+//! Where only a Cyrillic form is listed, [`latin_forms`] adds the two common
+//! English renderings of it — *Zhaparov* and *Japarov* are the same name.
 
 use crate::discovery::{
     DiscoveryBudget, DiscoverySource, Federated, Query, Span, federate_refs, merge,
@@ -33,7 +41,8 @@ const MAX_NAMES: usize = 4;
 /// Longer than this is a description or a sentence, not a name.
 const MAX_NAME_CHARS: usize = 60;
 
-/// English, deliberately — see the module note.
+/// The English verbs, used for Latin-script names. Native-script names use
+/// [`native_predicates`].
 const PREDICATES: &[&str] = &[
     "visit",
     "state visit",
@@ -134,12 +143,15 @@ pub fn expand(plan: &Plan) -> Vec<Query> {
     }
 
     // Predicate variants fill what is left: each predicate across every name
-    // before the next predicate, so a small budget still spans the names.
-    for predicate in PREDICATES {
+    // before the next predicate, so a small budget still spans the names. A
+    // name in another script takes that script's verbs in the same position.
+    for (i, predicate) in PREDICATES.iter().enumerate() {
         for name in &names {
+            let native = native_predicates(name);
+            let verb = native.get(i % native.len().max(1)).copied().unwrap_or(predicate);
             let text = match place {
-                Some(p) => format!("{} {} {p}", phrase(name), phrase(predicate)),
-                None => format!("{} {}", phrase(name), phrase(predicate)),
+                Some(p) => format!("{} {} {p}", phrase(name), phrase(verb)),
+                None => format!("{} {}", phrase(name), phrase(verb)),
             };
             out.push(text, plan.window.from.clone(), plan.window.to.clone());
         }
@@ -168,7 +180,7 @@ impl Builder {
             return;
         }
         if self.seen.insert((text.to_lowercase(), since.clone(), until.clone())) {
-            self.queries.push(Query { text, since, until, sites: Vec::new() });
+            self.queries.push(Query { text, since, until, sites: Vec::new(), post: None });
         }
     }
 }
@@ -235,6 +247,80 @@ fn script_of(name: &str) -> Script {
     }
 }
 
+/// The verbs a name's own press uses, by the script the name is written in.
+/// Empty for Latin script, which gets the English ones.
+///
+/// Arabic script splits by the letters it uses: Persian writes `پ چ ژ گ` and
+/// its own forms of `ی` and `ک`, Arabic does not, and the two say "visit"
+/// differently.
+fn native_predicates(name: &str) -> &'static [&'static str] {
+    match script_of(name) {
+        Script::Cyrillic => &["визит", "официальный визит", "поездка", "переговоры"],
+        Script::Arabic => {
+            if name.chars().any(|c| matches!(c, 'پ' | 'چ' | 'ژ' | 'گ' | 'ی' | 'ک')) {
+                &["سفر", "دیدار", "بازدید", "مذاکرات"]
+            } else {
+                &["زيارة", "زيارة رسمية", "محادثات", "لقاء"]
+            }
+        }
+        Script::Han => &["访问", "会见", "出访", "会谈"],
+        Script::Kana => &["訪問", "会談", "会見"],
+        Script::Hangul => &["방문", "회담", "정상회담"],
+        Script::Greek => &["επίσκεψη", "συνάντηση"],
+        Script::Hebrew => &["ביקור", "פגישה"],
+        Script::Devanagari => &["यात्रा", "दौरा", "मुलाकात"],
+        Script::Latin | Script::Other => &[],
+    }
+}
+
+/// English renderings of a Cyrillic name: the scheme most reference works use
+/// (*Zhaparov*, *Khrushchev*) and the plainer one most newspapers do (*Japarov*,
+/// *Hrushchev*). They differ only where the scripts disagree about a sound, so
+/// a name with none of those letters yields one form, not two. Empty for a
+/// name that is not Cyrillic.
+pub fn latin_forms(name: &str) -> Vec<String> {
+    if script_of(name) != Script::Cyrillic {
+        return Vec::new();
+    }
+    let reference = romanise(name, true);
+    let plain = romanise(name, false);
+    if reference == plain { vec![reference] } else { vec![reference, plain] }
+}
+
+fn romanise(name: &str, reference: bool) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        let lower = c.to_lowercase().next().unwrap_or(c);
+        let piece: &str = match lower {
+            'а' => "a", 'б' => "b", 'в' => "v", 'г' => "g", 'д' => "d", 'е' => "e", 'ё' => "yo",
+            'ж' => if reference { "zh" } else { "j" },
+            'з' => "z", 'и' => "i", 'й' => "y", 'к' => "k", 'л' => "l", 'м' => "m", 'н' => "n",
+            'о' => "o", 'п' => "p", 'р' => "r", 'с' => "s", 'т' => "t", 'у' => "u", 'ф' => "f",
+            'х' => if reference { "kh" } else { "h" },
+            'ц' => "ts", 'ч' => "ch", 'ш' => "sh",
+            'щ' => if reference { "shch" } else { "sch" },
+            'ъ' | 'ь' => "", 'ы' => "y", 'э' => "e", 'ю' => "yu", 'я' => "ya",
+            // Ukrainian, Belarusian, Kazakh, Kyrgyz and their neighbours.
+            'і' => "i", 'ї' => "yi", 'є' => "ye", 'ґ' => "g", 'ў' => "u",
+            'ү' | 'ұ' => "u", 'ө' => "o", 'ң' => "ng", 'қ' => "q", 'ғ' => "gh", 'һ' => "h", 'ә' => "a",
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        if c.is_uppercase() && !piece.is_empty() {
+            let mut chars = piece.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+                out.push_str(chars.as_str());
+            }
+        } else {
+            out.push_str(piece);
+        }
+    }
+    out
+}
+
 /// The names worth a query of their own: the user's text first, then
 /// alternating between a script not yet used and a further romanisation.
 ///
@@ -257,6 +343,16 @@ fn pick_names(query: &str, aliases: &[String], max: usize) -> Vec<String> {
         }
         if seen.insert(normalise(alias)) {
             pool.push((script_of(alias), alias.to_string()));
+        }
+    }
+
+    // Spellings the record does not list, behind the ones it does. A Cyrillic
+    // alias with no recorded romanisation is the usual reason.
+    for alias in aliases {
+        for form in latin_forms(alias.trim()) {
+            if form.chars().count() <= MAX_NAME_CHARS && seen.insert(normalise(&form)) {
+                pool.push((Script::Latin, form));
+            }
         }
     }
 
@@ -339,6 +435,7 @@ pub async fn research(
     let mut terms = first.terms;
     let mut failures = first.failures;
     let span = first.span;
+    let subject = first.subject;
     let mut ran = 0;
     for query in &queries {
         if live.is_empty() {
@@ -365,6 +462,7 @@ pub async fn research(
             leads: merge(leads, budget.max_candidates),
             terms,
             span,
+            subject,
             failures,
         },
         window,

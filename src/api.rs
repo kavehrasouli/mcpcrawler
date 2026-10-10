@@ -101,11 +101,11 @@ pub async fn fetch_body(
     Err(CrawlError::Status(last_status.unwrap_or(0)))
 }
 
-fn worth_retrying(status: u16) -> bool {
+pub(crate) fn worth_retrying(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
-fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     let seconds: u64 = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
@@ -120,7 +120,7 @@ fn retry_after(response: &reqwest::Response) -> Option<Duration> {
 /// Exponential backoff with enough jitter that concurrent retries do not all
 /// fire on the same tick. The clock is the entropy source — a random-number
 /// dependency would be a lot of crate for a quarter-second of spread.
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     let base = Duration::from_millis(250 * (1_u64 << (attempt - 1)));
     let jitter = SystemTime::now()
         .duration_since(UNIX_EPOCH)

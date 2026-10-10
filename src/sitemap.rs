@@ -7,8 +7,10 @@
 //! pages, all reachable with plain GETs and no browser.
 
 use crate::crawler::{
-    CrawlError, HostSlots, USER_AGENT, canonicalize, fetch_bytes, host_of, throttle,
+    CrawlError, HostSlots, USER_AGENT, canonicalize, fetch_bytes, host_of, read_truncated,
+    throttle,
 };
+use crate::limits;
 use futures::future::join_all;
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -40,6 +42,11 @@ pub struct SitemapConfig {
     pub concurrency: usize,
     pub per_host_delay: Duration,
     pub max_body_bytes: usize,
+    /// What one document may expand to once decompressed.
+    pub max_decoded_bytes: usize,
+    /// Decompressed bytes across every document in the walk. Without it a site
+    /// can hand over a thousand files that are each under the limit.
+    pub max_total_bytes: usize,
     /// Keep only URLs containing this substring, matched case-insensitively.
     /// Applied while walking, so a filtered scan can cover far more of a large
     /// index within the same `max_urls` budget.
@@ -56,6 +63,8 @@ impl Default for SitemapConfig {
             per_host_delay: Duration::from_millis(300),
             // Sitemaps are far larger than pages; a gzipped child can be tens of MB.
             max_body_bytes: 64 * 1024 * 1024,
+            max_decoded_bytes: limits::MAX_DECODED_BYTES,
+            max_total_bytes: 4 * limits::MAX_DECODED_BYTES,
             contains: None,
         }
     }
@@ -88,9 +97,11 @@ pub async fn discover(client: &Client, site: &str) -> Result<Vec<Url>, CrawlErro
     let origin = base.origin().ascii_serialization();
     let mut found: Vec<Url> = Vec::new();
 
+    // Read to a fixed size, like every other robots.txt fetch: a sitemap
+    // directive past the limit is not worth an unbounded read.
     if let Ok(response) = client.get(format!("{origin}/robots.txt")).send().await
         && response.status().is_success()
-        && let Ok(body) = response.bytes().await
+        && let body = read_truncated(response, limits::MAX_ROBOTS_BYTES).await
         && let Ok(robot) = Robot::new(USER_AGENT, &body)
     {
         found.extend(
@@ -132,16 +143,24 @@ enum Document {
     Urls(Vec<SitemapEntry>),
 }
 
-/// Transparently gunzip. Child sitemaps are usually served as `.gz` files, which
-/// is content encoding the HTTP layer does not undo for us.
-fn maybe_gunzip(bytes: Vec<u8>) -> Vec<u8> {
+/// Transparently gunzip, refusing a document that expands past `limit`.
+///
+/// Child sitemaps are usually served as `.gz` files, which is content encoding
+/// the HTTP layer does not undo for us. The limit is on the *decoded* size: a
+/// few kilobytes of gzip can stand for gigabytes, and a cap on the bytes that
+/// crossed the wire never sees them. Data that only looks like gzip is passed
+/// through as it came.
+fn maybe_gunzip(bytes: Vec<u8>, limit: usize) -> Result<Vec<u8>, CrawlError> {
     if !bytes.starts_with(&[0x1f, 0x8b]) {
-        return bytes;
+        return Ok(bytes);
     }
     let mut decoded = Vec::new();
-    match flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut decoded) {
-        Ok(_) => decoded,
-        Err(_) => bytes,
+    // One byte past the limit is enough to know it was exceeded.
+    let mut reader = flate2::read::GzDecoder::new(&bytes[..]).take(limit as u64 + 1);
+    match reader.read_to_end(&mut decoded) {
+        Ok(_) if decoded.len() > limit => Err(CrawlError::TooLarge(limit)),
+        Ok(_) => Ok(decoded),
+        Err(_) => Ok(bytes),
     }
 }
 
@@ -153,11 +172,34 @@ fn parse(xml: &str, base: &Url) -> Result<Document, CrawlError> {
 
     let mut is_index = false;
     let mut entries = Vec::new();
-    let mut tag = String::new();
+    // The open elements, by local name. `<loc>` counts only as a direct child
+    // of `<url>` or `<sitemap>`: image, video and news extensions each nest a
+    // `<loc>` of their own, and taking any `<loc>` let an image's address
+    // overwrite the page's.
+    let mut path: Vec<String> = Vec::new();
     let mut loc: Option<String> = None;
     let mut lastmod: Option<String> = None;
+    let mut events = 0usize;
+
+    let field = |path: &[String], text: String, loc: &mut Option<String>, lastmod: &mut Option<String>| {
+        let [.., parent, name] = path else { return };
+        if parent != "url" && parent != "sitemap" {
+            return;
+        }
+        match name.as_str() {
+            "loc" => *loc = Some(text),
+            "lastmod" => *lastmod = Some(text),
+            _ => {}
+        }
+    };
 
     loop {
+        events += 1;
+        // A document of nothing but tiny elements fits comfortably under a byte
+        // limit and still costs unbounded work to walk.
+        if events > limits::MAX_XML_EVENTS {
+            return Err(CrawlError::Parse("document has too many elements".to_string()));
+        }
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 // Sitemaps are namespaced, so match on the local name only.
@@ -165,7 +207,10 @@ fn parse(xml: &str, base: &Url) -> Result<Document, CrawlError> {
                 if name == "sitemapindex" {
                     is_index = true;
                 }
-                tag = name;
+                path.push(name);
+                if path.len() > limits::MAX_XML_DEPTH {
+                    return Err(CrawlError::Parse("elements nested too deeply".to_string()));
+                }
             }
             Ok(Event::Text(e)) => {
                 let raw = e.into_inner();
@@ -174,16 +219,19 @@ fn parse(xml: &str, base: &Url) -> Result<Document, CrawlError> {
                     Err(_) => raw.trim().to_string(),
                 };
                 if !text.is_empty() {
-                    match tag.as_str() {
-                        "loc" => loc = Some(text),
-                        "lastmod" => lastmod = Some(text),
-                        _ => {}
-                    }
+                    field(&path, text, &mut loc, &mut lastmod);
+                }
+            }
+            // `<loc><![CDATA[…]]></loc>` is common in generated sitemaps.
+            Ok(Event::CData(e)) => {
+                let text = e.into_inner().trim().to_string();
+                if !text.is_empty() {
+                    field(&path, text, &mut loc, &mut lastmod);
                 }
             }
             Ok(Event::End(e)) => {
                 let name = e.local_name().as_ref().to_string();
-                if name == "sitemap" || name == "url" {
+                if (name == "sitemap" || name == "url") && path.len() >= 2 {
                     if let Some(raw) = loc.take()
                         && let Ok(joined) = base.join(&raw)
                         && let Ok(url) = canonicalize(joined.as_str())
@@ -192,7 +240,7 @@ fn parse(xml: &str, base: &Url) -> Result<Document, CrawlError> {
                     }
                     lastmod = None;
                 }
-                tag.clear();
+                path.pop();
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(CrawlError::Parse(e.to_string())),
@@ -234,16 +282,26 @@ pub async fn collect(
     let mut queue: VecDeque<(Url, u32)> = roots.into_iter().map(|u| (u, 0)).collect();
     let mut seen: HashSet<String> = queue.iter().map(|(u, _)| u.to_string()).collect();
     let mut outcome = SitemapOutcome::default();
+    let mut decoded_total = 0usize;
 
     while !queue.is_empty() {
-        if outcome.entries.len() >= cfg.max_urls || outcome.sitemaps_read >= cfg.max_sitemaps {
+        // Every attempt spends the sitemap budget, successful or not: a failed
+        // fetch still cost a request.
+        let attempts = outcome.sitemaps_read + outcome.failed.len();
+        if outcome.entries.len() >= cfg.max_urls
+            || attempts >= cfg.max_sitemaps
+            || decoded_total >= cfg.max_total_bytes
+        {
             outcome.truncated = true;
             break;
         }
 
         // One batch at a time keeps concurrency bounded without a worker pool;
-        // every task here is waiting on the network.
-        let batch: Vec<(Url, u32)> = (0..cfg.concurrency.max(1))
+        // every task here is waiting on the network. The batch is cut to what
+        // is left of the budget, so the limit holds exactly and not "to within
+        // one batch".
+        let room = cfg.max_sitemaps - attempts;
+        let batch: Vec<(Url, u32)> = (0..cfg.concurrency.max(1).min(room))
             .filter_map(|_| queue.pop_front())
             .collect();
 
@@ -266,7 +324,15 @@ pub async fn collect(
                 }
             };
 
-            let xml = String::from_utf8_lossy(&maybe_gunzip(bytes)).into_owned();
+            let decoded = match maybe_gunzip(bytes, cfg.max_decoded_bytes) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    outcome.failed.push((url.to_string(), e.to_string()));
+                    continue;
+                }
+            };
+            decoded_total += decoded.len();
+            let xml = String::from_utf8_lossy(&decoded).into_owned();
             let document = match parse(&xml, &url) {
                 Ok(document) => document,
                 Err(e) => {

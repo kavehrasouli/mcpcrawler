@@ -2,6 +2,8 @@ use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
 use futures::future::join_all;
 use reqwest::Client;
+use crate::limits;
+use crate::metrics;
 use crate::scoring::{LinkContext, ON_TOPIC, Terms, score_link};
 use scraper::{Html, Node, Selector};
 use std::cmp::Ordering as CmpOrdering;
@@ -14,6 +16,10 @@ use texting_robots::Robot;
 use url::Url;
 
 pub const USER_AGENT: &str = "mcpcrawler/0.1";
+
+/// `1`/`true`/`yes` runs the headless browser without its sandbox. For
+/// containers only; see docs/deployment.md.
+pub const NO_SANDBOX_ENV: &str = "MCPCRAWLER_BROWSER_NO_SANDBOX";
 
 const BLOCKED_DOMAINS: &[&str] = &[
     "google-analytics.com",
@@ -86,6 +92,26 @@ impl fmt::Display for CrawlError {
     }
 }
 
+impl CrawlError {
+    /// A short stable name for the kind of failure, for clients that branch on
+    /// it. The wording of the message may change; these do not.
+    pub fn code(&self) -> &'static str {
+        match self {
+            CrawlError::BadUrl(_) => "bad_url",
+            CrawlError::UnsupportedScheme(_) => "unsupported_scheme",
+            CrawlError::Transport(_) => "network",
+            CrawlError::Status(_) => "http_status",
+            CrawlError::ContentType(_) => "not_html",
+            CrawlError::TooLarge(_) => "too_large",
+            CrawlError::Browser(_) => "browser",
+            CrawlError::Parse(_) => "parse",
+            CrawlError::Blocked(_) => "blocked",
+            CrawlError::Json(_) => "bad_json",
+            CrawlError::RateLimited(_) => "rate_limited",
+        }
+    }
+}
+
 impl std::error::Error for CrawlError {}
 
 impl From<reqwest::Error> for CrawlError {
@@ -136,6 +162,30 @@ pub struct CrawlConfig {
     /// pruning on the first bad score cuts exactly the paths that lead to
     /// archives. This is the tunnelling allowance.
     pub tunnel_slack: u32,
+    /// Wall-clock budget for the whole crawl. The page budget bounds how much is
+    /// fetched, not how long it takes: one host that answers a byte a second
+    /// would hold a crawl open for as long as it likes. `None` is unbounded.
+    pub deadline: Option<Duration>,
+    /// Whether pages go through the headless browser.
+    pub render: Render,
+    /// Retries per request for the failures worth retrying (429, 5xx, a
+    /// refused or timed-out connection). The total across a crawl is capped at
+    /// `max_pages`, so retrying cannot multiply the work the budget allows.
+    pub max_retries: u32,
+}
+
+/// Whether, and when, a crawl uses the headless browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Render {
+    /// Plain HTTP only.
+    #[default]
+    Never,
+    /// HTTP first; a page that comes back with no links and almost no text is
+    /// fetched again in the browser. Cheap for the sites that need no browser,
+    /// which is most of them.
+    Auto,
+    /// Every page through the browser. Slow, and a tab each.
+    Always,
 }
 
 impl Default for CrawlConfig {
@@ -151,6 +201,9 @@ impl Default for CrawlConfig {
             seed_from_sitemap: false,
             focus: None,
             tunnel_slack: 2,
+            deadline: Some(Duration::from_secs(300)),
+            render: Render::Never,
+            max_retries: 2,
         }
     }
 }
@@ -239,10 +292,17 @@ pub fn dedup_key(url: &Url) -> String {
         .host_str()
         .map(|h| h.trim_start_matches("www.").to_lowercase())
         .unwrap_or_default();
+    // The scheme is ignored — `http` and `https` serve one document nearly
+    // everywhere, and crawling both is waste. A port is not: `:8080` is a
+    // different server, so it stays unless it is the scheme's default (which
+    // `Url::port` already reports as absent). Internationalised names arrive
+    // as punycode, so two spellings of one name compare equal. The path is
+    // case-sensitive because servers are.
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
     let path = url.path().trim_end_matches('/');
     match url.query() {
-        Some(q) => format!("{host}{path}?{q}"),
-        None => format!("{host}{path}"),
+        Some(q) => format!("{host}{port}{path}?{q}"),
+        None => format!("{host}{port}{path}"),
     }
 }
 
@@ -271,9 +331,42 @@ fn looks_like_html(content_type: &str) -> bool {
         || ct.is_empty()
 }
 
-/// Fetch one page, rejecting error statuses, non-HTML bodies, and oversized
-/// responses. The body is streamed so a huge file is abandoned rather than
-/// buffered in full.
+/// Read a body to the end, refusing one that exceeds `max`. A declared
+/// `Content-Length` over the limit is refused before a byte is read; one that
+/// is absent or understated is caught as the bytes arrive.
+pub(crate) async fn read_limited(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, CrawlError> {
+    if response.content_length().is_some_and(|n| n > max as u64) {
+        return Err(CrawlError::TooLarge(max));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > max {
+            return Err(CrawlError::TooLarge(max));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    metrics::add(&metrics::BYTES_FETCHED, body.len() as u64);
+    Ok(body)
+}
+
+/// As [`read_limited`], but a long body is cut at `max` rather than refused.
+/// For `robots.txt`, where the convention is to read what fits and ignore the
+/// rest.
+pub(crate) async fn read_truncated(mut response: reqwest::Response, max: usize) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    while body.len() < max {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body.truncate(max);
+    body
+}
+
 /// Fetch a URL as raw bytes, with the status and size guards but no content-type
 /// gate. Sitemaps are XML and frequently gzipped, so they cannot go through
 /// `fetch_page`.
@@ -283,56 +376,89 @@ pub async fn fetch_bytes(
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, CrawlError> {
     allowed(url)?;
-    let mut response = client.get(url.clone()).send().await?;
+    let _permit = limits::HTTP.acquire().await.map_err(|_| shutting_down_error())?;
+    let response = client.get(url.clone()).send().await?;
 
     let status = response.status();
+    metrics::status(status.as_u16());
     if !status.is_success() {
         return Err(CrawlError::Status(status.as_u16()));
     }
-
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > max_body_bytes {
-            return Err(CrawlError::TooLarge(max_body_bytes));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    read_limited(response, max_body_bytes).await
 }
 
+fn shutting_down_error() -> CrawlError {
+    CrawlError::Transport("the server is shutting down".to_string())
+}
+
+/// Fetch one page, rejecting error statuses, non-HTML bodies, and oversized
+/// responses. The body is streamed so a huge file is abandoned rather than
+/// buffered in full.
 pub async fn fetch_page(
     client: &Client,
     url: &Url,
     max_body_bytes: usize,
 ) -> Result<String, CrawlError> {
     allowed(url)?;
-    let mut response = client.get(url.clone()).send().await?;
+    let _permit = limits::HTTP.acquire().await.map_err(|_| shutting_down_error())?;
+    let response = client.get(url.clone()).send().await?;
 
     let status = response.status();
+    metrics::status(status.as_u16());
     if !status.is_success() {
         return Err(CrawlError::Status(status.as_u16()));
     }
+    html_body(response, max_body_bytes).await
+}
 
+/// The body of a response that is meant to be a page.
+async fn html_body(response: reqwest::Response, max: usize) -> Result<String, CrawlError> {
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-
     if !looks_like_html(&content_type) {
         return Err(CrawlError::ContentType(content_type));
     }
-
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > max_body_bytes {
-            return Err(CrawlError::TooLarge(max_body_bytes));
-        }
-        body.extend_from_slice(&chunk);
-    }
-
+    let body = read_limited(response, max).await?;
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Redirect hops a crawl will follow before giving up on a URL.
+const MAX_REDIRECTS: usize = 5;
+
+static MANUAL: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+
+/// A client that does not follow redirects, so the crawler can.
+///
+/// `reqwest` follows a redirect without asking anyone, which means a redirect
+/// can carry a request somewhere the crawl would never have gone: a blocked
+/// domain, a host its robots.txt disallows, or off the seed's domain under
+/// `same_domain_only`. Following each hop here puts every one of those checks
+/// on every hop. The destination guard is unchanged — the resolver still
+/// vets every connection.
+fn manual_client() -> Result<&'static Client, CrawlError> {
+    if let Some(client) = MANUAL.get() {
+        return Ok(client);
+    }
+    let policy = crate::net::policy();
+    let builder = Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(8))
+        .dns_resolver(crate::net::resolver(policy))
+        .redirect(reqwest::redirect::Policy::none());
+    // The suite's fixture server answers to `crawler.test`, a name the
+    // caller-supplied test client pins to loopback. This client is built
+    // separately, so it needs the same pin; the port comes from the URL.
+    #[cfg(test)]
+    let builder = ["crawler.test", "robots5xx.test", "bigrobots.test", "norobots.test"].iter().fold(builder, |b, name| {
+        b.resolve(name, std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+    });
+    let built = builder.build().map_err(|e| CrawlError::Transport(e.to_string()))?;
+    Ok(MANUAL.get_or_init(|| built))
 }
 
 // headless browser
@@ -352,10 +478,14 @@ async fn shared_browser() -> Result<Arc<tokio::sync::Mutex<Browser>>, CrawlError
     BROWSER
         .get_or_try_init(|| async {
             sweep_stale_profiles();
-            let config = BrowserConfig::builder()
-                .user_data_dir(PROFILE_DIR.as_path())
-                .build()
-                .map_err(CrawlError::Browser)?;
+            let mut builder = BrowserConfig::builder().user_data_dir(PROFILE_DIR.as_path());
+            // Chrome refuses to start as root inside a container with its sandbox
+            // on. Turning the sandbox off is a real reduction in protection, so
+            // it is a deliberate, named setting and never the default.
+            if crate::config::flag(NO_SANDBOX_ENV) {
+                builder = builder.no_sandbox();
+            }
+            let config = builder.build().map_err(CrawlError::Browser)?;
             let (browser, mut handler) = Browser::launch(config)
                 .await
                 .map_err(|e| CrawlError::Browser(e.to_string()))?;
@@ -402,13 +532,40 @@ fn sweep_stale_profiles() {
 
 /// Close the browser and remove its profile directory. Must run before the
 /// process exits, or Chrome is orphaned and the profile is left behind.
+/// Close the browser and delete its profile, within a few seconds and whatever
+/// state it is in.
+///
+/// Asking Chrome to close is the polite path. If it does not answer — a hung
+/// tab, a handler task that has stopped — the process is killed outright:
+/// leaving a headless browser running after the server has gone is the worse
+/// outcome, and a bounded wait is what keeps shutdown itself from becoming the
+/// thing that hangs.
 pub async fn shutdown_browser() {
+    const POLITE: Duration = Duration::from_secs(4);
     if let Some(browser) = BROWSER.get() {
-        let mut browser = browser.lock().await;
-        let _ = browser.close().await;
-        let _ = browser.wait().await;
+        metrics::info("browser_closing", "shutdown", &[]);
+        match tokio::time::timeout(POLITE, browser.lock()).await {
+            Ok(mut browser) => {
+                let closed = tokio::time::timeout(POLITE, async {
+                    let _ = browser.close().await;
+                    let _ = browser.wait().await;
+                })
+                .await;
+                if closed.is_err() {
+                    metrics::warn("browser_close_timed_out", "shutdown", &[]);
+                    let _ = tokio::time::timeout(POLITE, browser.kill()).await;
+                }
+            }
+            Err(_) => {
+                // Something holds the browser and will not let go; the lock is
+                // not needed to remove what is left on disk, and the process
+                // exit that follows takes the child with it where it can.
+                metrics::warn("browser_busy_at_shutdown", "shutdown", &[]);
+            }
+        }
     }
     let _ = std::fs::remove_dir_all(PROFILE_DIR.as_path());
+    metrics::info("browser_closed", "shutdown", &[]);
 }
 
 /// How long to let a client-rendered page settle before reading its DOM.
@@ -424,13 +581,25 @@ async fn open_settled_page(
     browser: &tokio::sync::Mutex<Browser>,
     url: &str,
     settle: Duration,
+    context: Option<&chromiumoxide::cdp::browser_protocol::browser::BrowserContextId>,
 ) -> Result<chromiumoxide::page::Page, CrawlError> {
     let page = {
         let browser = browser.lock().await;
-        browser
-            .new_page(url)
-            .await
-            .map_err(|e| CrawlError::Browser(e.to_string()))?
+        metrics::inc(&metrics::TABS_OPENED);
+        match context {
+            // A tab in its own context shares no cookies, storage or cache with
+            // any other.
+            Some(id) => {
+                let target = chromiumoxide::cdp::browser_protocol::target::CreateTargetParams::builder()
+                    .url(url)
+                    .browser_context_id(id.clone())
+                    .build()
+                    .map_err(CrawlError::Browser)?;
+                browser.new_page(target).await
+            }
+            None => browser.new_page(url).await,
+        }
+        .map_err(|e| CrawlError::Browser(e.to_string()))?
     };
 
     if let Err(e) = page.wait_for_navigation().await {
@@ -455,17 +624,27 @@ async fn open_settled_page(
 
 pub async fn fetch_page_headless(url: &str) -> Result<String, CrawlError> {
     let url = canonicalize(url)?;
+    allowed(&url)?;
+    let _tab = limits::TABS.acquire().await.map_err(|_| shutting_down_error())?;
     let browser = shared_browser().await?;
-    let page = open_settled_page(&browser, url.as_str(), DEFAULT_SETTLE).await?;
+    let page = open_settled_page(&browser, url.as_str(), DEFAULT_SETTLE, None).await?;
 
     // Read separately so the tab is closed on every path, not just success.
-    let result = page
-        .content()
-        .await
-        .map_err(|e| CrawlError::Browser(e.to_string()));
+    let result = read_dom(&page).await;
 
     let _ = page.close().await;
     result
+}
+
+/// The rendered DOM, refused past [`limits::MAX_DOM_BYTES`]. A page script can
+/// grow its own document without bound, and the size limit on the wire never
+/// saw it.
+async fn read_dom(page: &chromiumoxide::page::Page) -> Result<String, CrawlError> {
+    let html = page.content().await.map_err(|e| CrawlError::Browser(e.to_string()))?;
+    if html.len() > limits::MAX_DOM_BYTES {
+        return Err(CrawlError::TooLarge(limits::MAX_DOM_BYTES));
+    }
+    Ok(html)
 }
 
 const USERNAME_SELECTORS: &[&str] = &[
@@ -510,15 +689,53 @@ async fn find_element_any(
     None
 }
 
+/// Log in and return the page that follows.
+///
+/// **Sessions do not persist.** Each call gets a browser context of its own,
+/// discarded when the call ends, so cookies, storage and cache from one login
+/// never reach another call, another site, or the shared browser the ordinary
+/// headless fetches use. The cost is that a login cannot be reused by a later
+/// call; the point is that a credential for one site cannot leak into a
+/// request for another.
 pub async fn login_and_fetch(
     login_url: &str,
     username: &str,
     password: &str,
 ) -> Result<String, CrawlError> {
     let login_url = canonicalize(login_url)?;
+    allowed(&login_url)?;
+    let _tab = limits::TABS.acquire().await.map_err(|_| shutting_down_error())?;
     let browser = shared_browser().await?;
 
-    let page = open_settled_page(&browser, login_url.as_str(), DEFAULT_SETTLE).await?;
+    let context = {
+        let browser = browser.lock().await;
+        browser
+            .create_browser_context(
+                chromiumoxide::cdp::browser_protocol::target::CreateBrowserContextParams::default(),
+            )
+            .await
+            .map_err(|e| CrawlError::Browser(e.to_string()))?
+    };
+
+    let result = login_in_context(&browser, &context, &login_url, username, password).await;
+
+    // Disposing the context is what discards the session. It runs on every
+    // path, including a failed login.
+    {
+        let browser = browser.lock().await;
+        let _ = browser.dispose_browser_context(context).await;
+    }
+    result
+}
+
+async fn login_in_context(
+    browser: &tokio::sync::Mutex<Browser>,
+    context: &chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
+    login_url: &Url,
+    username: &str,
+    password: &str,
+) -> Result<String, CrawlError> {
+    let page = open_settled_page(browser, login_url.as_str(), DEFAULT_SETTLE, Some(context)).await?;
 
     let result = async {
         find_element_any(&page, USERNAME_SELECTORS)
@@ -549,9 +766,7 @@ pub async fn login_and_fetch(
             .map_err(|e| CrawlError::Browser(e.to_string()))?;
 
         tokio::time::sleep(Duration::from_secs(3)).await;
-        page.content()
-            .await
-            .map_err(|e| CrawlError::Browser(e.to_string()))
+        read_dom(&page).await
     }
     .await;
 
@@ -570,6 +785,10 @@ pub struct FetchedPage {
     /// How much of the subject the fetched page turned out to contain, 0 to 1.
     /// Zero for an unfocused crawl, which has no subject to measure against.
     pub relevance: f32,
+    /// The URL that was asked for, when the page was reached through a
+    /// redirect. `url` is where it ended up, and is what its links resolve
+    /// against.
+    pub redirected_from: Option<Url>,
 }
 
 /// Where a candidate URL came from.
@@ -688,6 +907,10 @@ pub struct CrawlOutcome {
     pub failed: Vec<(String, String)>,
     pub robots_skipped: usize,
     pub budget_hit: bool,
+    /// The wall-clock budget ran out before the frontier did.
+    pub deadline_hit: bool,
+    /// Retries spent across the whole crawl.
+    pub retries: usize,
 }
 
 impl CrawlOutcome {
@@ -713,7 +936,9 @@ struct CrawlState {
     pages: Mutex<Vec<FetchedPage>>,
     failed: Mutex<Vec<(String, String)>>,
     host_slot: HostSlots,
-    robots: Mutex<HashMap<String, Option<Arc<Robot>>>>,
+    /// One cell per origin, so a hundred workers that all want the same site's
+    /// robots.txt on the first request make one request between them.
+    robots: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Verdict>>>>,
     active: AtomicUsize,
     claimed: AtomicUsize,
     /// Handed out in order so equally scored candidates keep their arrival
@@ -721,6 +946,10 @@ struct CrawlState {
     queued: AtomicUsize,
     robots_skipped: AtomicUsize,
     budget_hit: AtomicBool,
+    deadline_hit: AtomicBool,
+    retries: AtomicUsize,
+    deadline: Option<tokio::time::Instant>,
+    crawl_id: String,
     /// Every host the caller seeded. With one seed this is the old `seed_host`;
     /// with a federated frontier there is no single host to compare against.
     seed_hosts: HashSet<String>,
@@ -748,95 +977,372 @@ pub async fn throttle(slots: &HostSlots, host: &str, delay: Duration) {
     }
 }
 
-async fn robots_for(
+/// What a site's robots.txt says about this crawler.
+#[derive(Clone)]
+enum Verdict {
+    AllowAll,
+    DenyAll,
+    /// The robots.txt could not be fetched because the destination itself is
+    /// not allowed. Not a robots decision, so it is reported as a refusal.
+    Refused(String),
+    Rules(Arc<Robot>),
+}
+
+impl Verdict {
+    fn allows(&self, url: &Url) -> bool {
+        match self {
+            Verdict::AllowAll => true,
+            Verdict::DenyAll | Verdict::Refused(_) => false,
+            Verdict::Rules(robot) => robot.allowed(url.as_str()),
+        }
+    }
+}
+
+/// Fetch and read one origin's robots.txt.
+///
+/// **The failure policy is the standard one, and it is not the lenient one.**
+/// A 4xx — including 404 — means the site publishes no rules, so everything is
+/// allowed. A 5xx, or no answer at all, means the rules exist but cannot be
+/// read, and the crawler must assume it may fetch nothing: guessing "allowed"
+/// is how a crawler hits exactly the pages a broken server meant to hide. The
+/// cost is that a site with a flaky robots.txt is skipped until it answers.
+///
+/// The request shares the host's rate limit with page fetches and is read to a
+/// fixed size, so it cannot be a way around either.
+async fn load_robots(client: &Client, state: &CrawlState, cfg: &CrawlConfig, origin: &str) -> Verdict {
+    let Ok(robots_url) = Url::parse(&format!("{origin}/robots.txt")) else {
+        return Verdict::AllowAll;
+    };
+    if allowed(&robots_url).is_err() {
+        return Verdict::DenyAll;
+    }
+    throttle(&state.host_slot, &host_of(&robots_url), cfg.per_host_delay).await;
+    let Ok(_permit) = limits::HTTP.acquire().await else {
+        return Verdict::DenyAll;
+    };
+    let response = match client.get(robots_url).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            // The destination guard speaks through the resolver, so a refusal
+            // arrives as a transport error; its wording is marked.
+            let why = CrawlError::from(e).to_string();
+            return if why.contains(crate::net::REFUSAL_MARK) {
+                Verdict::Refused(why)
+            } else {
+                Verdict::DenyAll
+            };
+        }
+    };
+    let status = response.status();
+    metrics::status(status.as_u16());
+    if status.is_server_error() {
+        return Verdict::DenyAll;
+    }
+    if !status.is_success() {
+        return Verdict::AllowAll;
+    }
+    let body = read_truncated(response, limits::MAX_ROBOTS_BYTES).await;
+    match Robot::new(USER_AGENT, &body) {
+        Ok(robot) => Verdict::Rules(Arc::new(robot)),
+        Err(_) => Verdict::AllowAll,
+    }
+}
+
+async fn robots_verdict(
     client: &Client,
     state: &CrawlState,
+    cfg: &CrawlConfig,
     url: &Url,
-) -> Option<Arc<Robot>> {
+) -> Verdict {
     let origin = url.origin().ascii_serialization();
+    let cell = state.robots.lock().unwrap().entry(origin.clone()).or_default().clone();
+    cell.get_or_init(|| load_robots(client, state, cfg, &origin)).await.clone()
+}
 
-    if let Some(cached) = state.robots.lock().unwrap().get(&origin) {
-        return cached.clone();
+/// A page, and where the fetch actually ended up.
+struct Fetched {
+    html: String,
+    url: Url,
+    redirected: bool,
+}
+
+enum FetchFail {
+    /// The site's robots.txt disallows it. Counted apart from failures: nothing
+    /// went wrong.
+    Robots,
+    Error(CrawlError),
+}
+
+impl From<CrawlError> for FetchFail {
+    fn from(e: CrawlError) -> Self {
+        FetchFail::Error(e)
     }
+}
 
-    let robots_url = format!("{origin}/robots.txt");
-    let parsed = match client.get(&robots_url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-            Ok(body) => Robot::new(USER_AGENT, &body).ok().map(Arc::new),
-            Err(_) => None,
-        },
-        // No robots.txt, or it could not be read: nothing is disallowed.
-        _ => None,
-    };
+/// Everything that must hold before a request goes to `url` — whether it is
+/// the seed or the third hop of a redirect chain.
+async fn check_hop(
+    client: &Client,
+    state: &CrawlState,
+    cfg: &CrawlConfig,
+    url: &Url,
+    hop: usize,
+) -> Result<(), FetchFail> {
+    allowed(url)?;
+    if hop > 0 {
+        // A seed is the caller's own choice; a redirect target is the server's.
+        let refuse = |why: String| {
+            metrics::inc(&metrics::REDIRECTS_REFUSED);
+            Err(FetchFail::Error(CrawlError::Blocked(why)))
+        };
+        if is_blocked(url) {
+            return refuse(format!("redirect to blocked domain {}", host_of(url)));
+        }
+        if cfg.same_domain_only && !state.seed_hosts.contains(&host_of(url)) {
+            return refuse(format!("redirect leaves the seeded domains for {}", host_of(url)));
+        }
+    }
+    if cfg.respect_robots {
+        let verdict = robots_verdict(client, state, cfg, url).await;
+        if let Verdict::Refused(why) = &verdict {
+            return Err(FetchFail::Error(CrawlError::Blocked(why.clone())));
+        }
+        if !verdict.allows(url) {
+            return Err(FetchFail::Robots);
+        }
+    }
+    throttle(&state.host_slot, &host_of(url), cfg.per_host_delay).await;
+    Ok(())
+}
 
-    state
-        .robots
-        .lock()
-        .unwrap()
-        .insert(origin, parsed.clone());
-    parsed
+/// Spend one retry from the crawl's shared allowance, if any is left.
+fn take_retry(state: &CrawlState, cfg: &CrawlConfig) -> bool {
+    if state.retries.fetch_add(1, Ordering::SeqCst) < cfg.max_pages {
+        metrics::inc(&metrics::RETRIES);
+        true
+    } else {
+        false
+    }
+}
+
+/// Send a request, retrying the failures a retry can fix: 429, 5xx, and a
+/// connection that was refused or timed out. A server that says how long to
+/// wait (`Retry-After`) is believed, up to a ceiling.
+async fn send_with_retries(
+    client: &Client,
+    state: &CrawlState,
+    cfg: &CrawlConfig,
+    url: &Url,
+) -> Result<reqwest::Response, CrawlError> {
+    let _permit = limits::HTTP.acquire().await.map_err(|_| shutting_down_error())?;
+    let mut attempt = 0u32;
+    loop {
+        match client.get(url.clone()).send().await {
+            Ok(response) => {
+                let code = response.status().as_u16();
+                if crate::api::worth_retrying(code)
+                    && attempt < cfg.max_retries
+                    && take_retry(state, cfg)
+                {
+                    attempt += 1;
+                    let wait = crate::api::retry_after(&response)
+                        .unwrap_or_else(|| crate::api::backoff(attempt));
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(e) => {
+                if (e.is_timeout() || e.is_connect())
+                    && attempt < cfg.max_retries
+                    && take_retry(state, cfg)
+                {
+                    attempt += 1;
+                    tokio::time::sleep(crate::api::backoff(attempt)).await;
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+/// Fetch a page over HTTP, following redirects one hop at a time so each hop is
+/// vetted the way a seed is: destination, blocked domains, the seed's domain,
+/// robots.txt. Relative `Location` values resolve against the URL that sent
+/// them, and the page's links later resolve against where it ended up.
+async fn fetch_checked(
+    client: &Client,
+    state: &CrawlState,
+    cfg: &CrawlConfig,
+    start: &Url,
+) -> Result<Fetched, FetchFail> {
+    let manual = manual_client()?;
+    let mut current = start.clone();
+
+    for hop in 0..=MAX_REDIRECTS {
+        check_hop(client, state, cfg, &current, hop).await?;
+        let response = send_with_retries(manual, state, cfg, &current).await?;
+        let status = response.status();
+        metrics::status(status.as_u16());
+
+        if status.is_redirection() {
+            let target = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok());
+            let Some(target) = target else {
+                return Err(CrawlError::Status(status.as_u16()).into());
+            };
+            let next = current
+                .join(target)
+                .map_err(|_| CrawlError::BadUrl(target.to_string()))?;
+            current = canonicalize(next.as_str())?;
+            metrics::inc(&metrics::REDIRECTS_FOLLOWED);
+            continue;
+        }
+        if !status.is_success() {
+            return Err(CrawlError::Status(status.as_u16()).into());
+        }
+
+        let html = html_body(response, cfg.max_body_bytes).await?;
+        let redirected = current != *start;
+        return Ok(Fetched { html, url: current, redirected });
+    }
+    Err(CrawlError::Transport(format!("more than {MAX_REDIRECTS} redirects")).into())
+}
+
+/// Fetch a page in the headless browser.
+///
+/// The browser follows redirects by itself, so the hops cannot be vetted one
+/// at a time; the place it ended up can, and is.
+async fn fetch_rendered(
+    client: &Client,
+    state: &CrawlState,
+    cfg: &CrawlConfig,
+    start: &Url,
+) -> Result<Fetched, FetchFail> {
+    check_hop(client, state, cfg, start, 0).await?;
+    let _tab = limits::TABS.acquire().await.map_err(|_| shutting_down_error())?;
+    let browser = shared_browser().await?;
+    let page = open_settled_page(&browser, start.as_str(), DEFAULT_SETTLE, None).await?;
+
+    let read = async {
+        let html = read_dom(&page).await?;
+        let landed = page
+            .url()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|u| canonicalize(&u).ok())
+            .unwrap_or_else(|| start.clone());
+        Ok::<_, CrawlError>((html, landed))
+    }
+    .await;
+    let _ = page.close().await;
+    let (html, landed) = read?;
+
+    let redirected = landed != *start;
+    if redirected {
+        check_hop(client, state, cfg, &landed, 1).await?;
+    }
+    Ok(Fetched { html, url: landed, redirected })
+}
+
+static APP_MARKERS: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("#root, #app, #__next, #__nuxt, #svelte, app-root, script[src]").unwrap()
+});
+
+/// Whether this HTML is the empty shell a client-rendered app serves before its
+/// script runs.
+///
+/// Few links and little text is not enough: a short plain page has both. A
+/// shell also carries the marks of an app waiting to start — a mount point
+/// (`#root`, `#app`, `#__next`…) or a script bundle — so all three are asked
+/// for, and a small ordinary page does not cost a browser tab.
+pub(crate) fn looks_unrendered_html(html: &str, base: &Url) -> bool {
+    let document = Html::parse_document(html);
+    links_in(&document, base).is_empty()
+        && text_of(&document).chars().count() < 200
+        && document.select(&APP_MARKERS).next().is_some()
+}
+
+fn looks_unrendered(page: &Fetched) -> bool {
+    looks_unrendered_html(&page.html, &page.url)
 }
 
 async fn process_one(client: &Client, state: &CrawlState, cfg: &CrawlConfig, item: Candidate) {
-    let Candidate { url, depth, origin, score, slack, .. } = item;
-    if cfg.respect_robots
-        && let Some(robot) = robots_for(client, state, &url).await
-        && !robot.allowed(url.as_str())
+    let Candidate { url: requested, depth, origin, score, slack, .. } = item;
+
+    let fetched = match cfg.render {
+        Render::Never => fetch_checked(client, state, cfg, &requested).await,
+        Render::Always => fetch_rendered(client, state, cfg, &requested).await,
+        Render::Auto => match fetch_checked(client, state, cfg, &requested).await {
+            Ok(page) if looks_unrendered(&page) => {
+                // The static fetch worked, so it is the fallback if rendering fails.
+                fetch_rendered(client, state, cfg, &requested).await.or(Ok(page))
+            }
+            other => other,
+        },
+    };
+
+    let Fetched { html, url, redirected } = match fetched {
+        Ok(page) => page,
+        Err(FetchFail::Robots) => {
+            state.robots_skipped.fetch_add(1, Ordering::Relaxed);
+            metrics::inc(&metrics::ROBOTS_SKIPS);
+            return;
+        }
+        Err(FetchFail::Error(e)) => {
+            // Recorded separately so a failed fetch is never reported as visited.
+            metrics::inc(&metrics::FETCH_FAILURES);
+            state.failed.lock().unwrap().push((requested.to_string(), e.to_string()));
+            return;
+        }
+    };
+
+    // A redirect can land on a page this crawl already has.
+    if redirected
+        && dedup_key(&url) != dedup_key(&requested)
+        && !state.seen.lock().unwrap().insert(dedup_key(&url))
     {
-        state.robots_skipped.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    metrics::inc(&metrics::PAGES_FETCHED);
+    metrics::debug(
+        "fetched",
+        &state.crawl_id,
+        &[("url", metrics::redact(&url)), ("depth", depth.to_string())],
+    );
 
-    throttle(&state.host_slot, &host_of(&url), cfg.per_host_delay).await;
-
-    match fetch_page(client, &url, cfg.max_body_bytes).await {
-        Ok(html) => {
-            let relevance = match &cfg.focus {
-                // Measured from the page that actually arrived, not inherited
-                // from how good its link looked. An index page whose link text
-                // promised everything and whose body says nothing should not
-                // lend its promise to its children.
-                Some(terms) if depth < cfg.max_depth => {
-                    let page = analyse(&html, &url);
-                    let relevance = terms.match_strength(&page.text);
-                    queue_links(state, cfg, &url, depth, slack, relevance, page.links, terms);
-                    relevance
-                }
-                Some(terms) => terms.match_strength(&extract_text(&html)),
-                None => {
-                    if depth < cfg.max_depth {
-                        let page = analyse(&html, &url);
-                        queue_links(
-                            state,
-                            cfg,
-                            &url,
-                            depth,
-                            slack,
-                            0.0,
-                            page.links,
-                            &Terms::default(),
-                        );
-                    }
-                    score
-                }
-            };
-
-            state.pages.lock().unwrap().push(FetchedPage {
-                url,
-                html,
-                origin,
-                relevance,
-            });
+    let relevance = match &cfg.focus {
+        // Measured from the page that actually arrived, not inherited
+        // from how good its link looked. An index page whose link text
+        // promised everything and whose body says nothing should not
+        // lend its promise to its children.
+        Some(terms) if depth < cfg.max_depth => {
+            let page = analyse(&html, &url);
+            let relevance = terms.match_strength(&page.text);
+            queue_links(state, cfg, &url, depth, slack, relevance, page.links, terms);
+            relevance
         }
-        Err(e) => {
-            // Recorded separately so a failed fetch is never reported as visited.
-            state
-                .failed
-                .lock()
-                .unwrap()
-                .push((url.to_string(), e.to_string()));
+        Some(terms) => terms.match_strength(&extract_text(&html)),
+        None => {
+            if depth < cfg.max_depth {
+                let page = analyse(&html, &url);
+                queue_links(state, cfg, &url, depth, slack, 0.0, page.links, &Terms::default());
+            }
+            score
         }
-    }
+    };
+
+    state.pages.lock().unwrap().push(FetchedPage {
+        redirected_from: redirected.then_some(requested),
+        url,
+        html,
+        origin,
+        relevance,
+    });
 }
 
 /// Queue a page's links, deciding for each whether it is worth a request.
@@ -861,6 +1367,9 @@ fn queue_links(
     let mut seen = state.seen.lock().unwrap();
 
     for link in links {
+        if frontier.len() >= limits::MAX_FRONTIER {
+            break;
+        }
         if is_blocked(&link.url) {
             continue;
         }
@@ -924,6 +1433,17 @@ async fn worker(client: &Client, state: &CrawlState, cfg: &CrawlConfig) {
             }
         };
 
+        // Stop taking work when the process is leaving or the clock has run out.
+        let out_of_time = state.deadline.is_some_and(|d| tokio::time::Instant::now() >= d);
+        if limits::shutting_down() || out_of_time {
+            if out_of_time {
+                state.deadline_hit.store(true, Ordering::SeqCst);
+            }
+            state.active.fetch_sub(1, Ordering::SeqCst);
+            state.frontier.lock().unwrap().clear();
+            return;
+        }
+
         if state.claimed.fetch_add(1, Ordering::SeqCst) >= cfg.max_pages {
             state.budget_hit.store(true, Ordering::SeqCst);
             state.active.fetch_sub(1, Ordering::SeqCst);
@@ -931,7 +1451,23 @@ async fn worker(client: &Client, state: &CrawlState, cfg: &CrawlConfig) {
             return;
         }
 
-        process_one(client, state, cfg, item).await;
+        // A request in flight when the deadline passes is abandoned, not waited
+        // for: a host answering a byte a second must not decide how long a
+        // crawl lasts.
+        match state.deadline {
+            Some(deadline) => {
+                let label = item.url.to_string();
+                if tokio::time::timeout_at(deadline, process_one(client, state, cfg, item))
+                    .await
+                    .is_err()
+                {
+                    state.deadline_hit.store(true, Ordering::SeqCst);
+                    state.failed.lock().unwrap().push((label, "deadline reached".to_string()));
+                    state.frontier.lock().unwrap().clear();
+                }
+            }
+            None => process_one(client, state, cfg, item).await,
+        }
 
         // Links are queued inside process_one, so the counter drops only after
         // any children are visible to peers.
@@ -1053,19 +1589,50 @@ pub async fn crawl_from(
         claimed: AtomicUsize::new(0),
         robots_skipped: AtomicUsize::new(0),
         budget_hit: AtomicBool::new(false),
+        deadline_hit: AtomicBool::new(false),
+        retries: AtomicUsize::new(0),
+        deadline: cfg.deadline.map(|d| tokio::time::Instant::now() + d),
+        crawl_id: metrics::crawl_id(),
         queued: AtomicUsize::new(queued),
         seed_hosts,
     };
+    metrics::info(
+        "crawl_start",
+        &state.crawl_id,
+        &[("seeds", state.frontier.lock().unwrap().len().to_string())],
+    );
+
+    // Crawls beyond the process-wide ceiling wait their turn.
+    let _slot = limits::CRAWLS.acquire().await.map_err(|_| shutting_down_error())?;
 
     let workers = cfg.max_concurrency.max(1);
     join_all((0..workers).map(|_| worker(client, &state, cfg))).await;
 
-    Ok(CrawlOutcome {
+    let outcome = CrawlOutcome {
         pages: state.pages.into_inner().unwrap(),
         failed: state.failed.into_inner().unwrap(),
         robots_skipped: state.robots_skipped.load(Ordering::SeqCst),
         budget_hit: state.budget_hit.load(Ordering::SeqCst),
-    })
+        deadline_hit: state.deadline_hit.load(Ordering::SeqCst),
+        retries: state.retries.load(Ordering::SeqCst).min(cfg.max_pages),
+    };
+    if outcome.budget_hit {
+        metrics::inc(&metrics::BUDGET_EXITS);
+    }
+    if outcome.deadline_hit {
+        metrics::inc(&metrics::DEADLINE_EXITS);
+    }
+    metrics::info(
+        "crawl_done",
+        &state.crawl_id,
+        &[
+            ("pages", outcome.pages.len().to_string()),
+            ("failed", outcome.failed.len().to_string()),
+            ("budget_hit", outcome.budget_hit.to_string()),
+            ("deadline_hit", outcome.deadline_hit.to_string()),
+        ],
+    );
+    Ok(outcome)
 }
 
 /// One URL per distinct host, so a sitemap is looked up once per site however

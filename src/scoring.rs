@@ -106,6 +106,14 @@ pub struct Terms {
     /// matching on its own. "Japarov" alone in an anchor is a real signal;
     /// "of" is not.
     words: Vec<String>,
+    /// Phrases in a script that is written without spaces, with their own
+    /// spaces removed.
+    ///
+    /// A phrase match asks for the name between spaces, and Chinese, Japanese,
+    /// Thai and their neighbours have none: the name is simply run into the
+    /// sentence around it. Compared against the text with its spaces removed
+    /// too, a name matches wherever it appears.
+    unspaced: Vec<String>,
 }
 
 /// Words too common to carry meaning. Not a full stop-word list — just the
@@ -117,6 +125,16 @@ const NOISE_WORDS: &[&str] = &[
 
 /// Shortest word worth matching alone.
 const MIN_WORD_LEN: usize = 4;
+/// The same for a word in a script written without spaces, where two
+/// characters are a word and four are a sentence.
+const MIN_UNSPACED_WORD_LEN: usize = 2;
+
+/// Whether `c` belongs to a script that does not put spaces between words:
+/// Thai, Lao, Myanmar, Khmer, and the Chinese, Japanese and Korean blocks.
+fn is_unspaced(c: char) -> bool {
+    matches!(c as u32,
+        0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0x2E80..=0xD7AF | 0xF900..=0xFAFF)
+}
 
 impl Terms {
     /// Build from a query and whatever aliases discovery turned up.
@@ -135,11 +153,18 @@ impl Terms {
                 continue;
             }
             for word in normalised.split(' ') {
-                if word.chars().count() >= MIN_WORD_LEN
+                let min = if word.chars().any(is_unspaced) { MIN_UNSPACED_WORD_LEN } else { MIN_WORD_LEN };
+                if word.chars().count() >= min
                     && !NOISE_WORDS.contains(&word)
                     && seen_words.insert(word.to_string())
                 {
                     terms.words.push(word.to_string());
+                }
+            }
+            if normalised.chars().any(is_unspaced) {
+                let compact: String = normalised.chars().filter(|c| *c != ' ').collect();
+                if !terms.unspaced.contains(&compact) {
+                    terms.unspaced.push(compact);
                 }
             }
             if seen_phrases.insert(normalised.clone()) {
@@ -168,6 +193,12 @@ impl Terms {
         }
         if self.phrases.iter().any(|p| haystack.contains(p.as_str())) {
             return 1.0;
+        }
+        if !self.unspaced.is_empty() {
+            let compact: String = haystack.chars().filter(|c| *c != ' ').collect();
+            if self.unspaced.iter().any(|p| compact.contains(p.as_str())) {
+                return 1.0;
+            }
         }
         if self.words.is_empty() {
             return 0.0;
@@ -331,7 +362,7 @@ fn is_droppable(c: char) -> bool {
 /// Returns an empty string for anything that should read as a separator.
 fn fold(c: char) -> &'static str {
     match c {
-        'a'..='z' | '0'..='9' => return leak_ascii(c),
+        'a'..='z' | '0'..='9' => leak_ascii(c),
         'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
         'ç' | 'ć' | 'č' | 'ĉ' | 'ċ' => "c",
         'ď' | 'đ' => "d",
@@ -372,7 +403,7 @@ fn fold(c: char) -> &'static str {
         '\u{0660}'..='\u{0669}' => leak_ascii(digit(c, '\u{0660}')),
         '\u{06F0}'..='\u{06F9}' => leak_ascii(digit(c, '\u{06F0}')),
         // Any other letter — Cyrillic, Greek, Arabic, CJK — is kept as-is.
-        c if c.is_alphanumeric() => return leak_char(c),
+        c if c.is_alphanumeric() => leak_char(c),
         _ => "",
     }
 }
@@ -517,6 +548,30 @@ pub fn score_link(link: &LinkContext, terms: &Terms, parent: f32) -> Option<f32>
     if shape.dead_end {
         score -= DEAD_END_PENALTY;
     }
+    score += host_prior(&link.url);
 
     Some(score.clamp(-1.0, 1.0))
+}
+
+/// What the host alone suggests, before the page is read.
+///
+/// A mild prior and no more: a government, university or treaty-organisation
+/// host is more likely to be the primary source for a question about what an
+/// official did, so its links sort slightly ahead of an otherwise equal link
+/// elsewhere. It is smaller than any single content signal, so it can break a
+/// tie but cannot make an unrelated link look on-topic.
+const INSTITUTIONAL_PRIOR: f32 = 0.06;
+
+fn host_prior(url: &Url) -> f32 {
+    let Some(host) = url.host_str() else { return 0.0 };
+    // Reversed, so index 0 is the top-level domain.
+    let labels: Vec<&str> = host.rsplit('.').collect();
+    let top = labels.first().copied().unwrap_or("");
+    // `gov`, `edu`, `int` and `mil` stand alone; a country domain says the same
+    // one level down (`gov.kg`, `ac.uk`, `go.jp`).
+    let institutional = matches!(top, "gov" | "edu" | "int" | "mil")
+        || (labels.len() >= 3
+            && top.len() == 2
+            && matches!(labels[1], "gov" | "go" | "edu" | "ac" | "mil"));
+    if institutional { INSTITUTIONAL_PRIOR } else { 0.0 }
 }

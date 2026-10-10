@@ -23,6 +23,16 @@ use url::{Host, Url};
 /// case; it just should not be the default.
 pub const ALLOW_PRIVATE_ENV: &str = "MCPCRAWLER_ALLOW_PRIVATE_NETWORKS";
 
+/// Comma-separated hosts exempt from the private-network refusal, and only
+/// those. `MCPCRAWLER_ALLOW_HOSTS=localhost,searxng.lan` lets the crawler reach
+/// a self-hosted search engine without opening the whole intranet, which is
+/// what `MCPCRAWLER_ALLOW_PRIVATE_NETWORKS=1` does.
+pub const ALLOW_HOSTS_ENV: &str = "MCPCRAWLER_ALLOW_HOSTS";
+
+/// Appears in every message the resolver gives for a refused destination, so
+/// a caller can tell a refusal from a network failure without matching prose.
+pub const REFUSAL_MARK: &str = "non-public addresses";
+
 /// Redirect hops allowed. Each one is re-checked, so this only bounds work.
 const MAX_REDIRECTS: usize = 5;
 
@@ -65,10 +75,40 @@ impl NetPolicy {
             Some(Host::Domain(_)) => return Ok(()),
             None => return Err("URL has no host".to_string()),
         };
-        if is_public(ip) {
+        if is_public(ip) || host_allowed(&ip.to_string()) {
             Ok(())
         } else {
             Err(format!("{ip} is not a public address"))
+        }
+    }
+}
+
+static ALLOWED_HOSTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Exempt one host — a name or an address — from the private-network refusal.
+/// Matched exactly and case-insensitively: allowing `localhost` does not allow
+/// `evil.localhost.example`, nor `127.0.0.2`.
+pub fn allow_host(host: &str) {
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    if host.is_empty() {
+        return;
+    }
+    let mut hosts = ALLOWED_HOSTS.lock().unwrap();
+    if !hosts.contains(&host) {
+        hosts.push(host);
+    }
+}
+
+pub fn host_allowed(host: &str) -> bool {
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    ALLOWED_HOSTS.lock().unwrap().contains(&host)
+}
+
+/// Read the allowlist from the environment.
+pub fn init_allowed_hosts_from_env() {
+    if let Ok(list) = std::env::var(ALLOW_HOSTS_ENV) {
+        for host in list.split(',') {
+            allow_host(host);
         }
     }
 }
@@ -124,15 +164,33 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_public_v4(v4);
     }
-    let segments = ip.segments();
+    let s = ip.segments();
+    let embedded = |hi: u16, lo: u16| {
+        let [a, b] = hi.to_be_bytes();
+        let [c, d] = lo.to_be_bytes();
+        Ipv4Addr::new(a, b, c, d)
+    };
+    // Transition addresses carry an IPv4 destination inside them, and a gateway
+    // that translates them will deliver to it: 64:ff9b::/96 (NAT64) holds it in
+    // the last 32 bits, 2002::/16 (6to4) in the next 32 after the prefix.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0; 4] {
+        return is_public_v4(embedded(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return is_public_v4(embedded(s[1], s[2]));
+    }
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
+        // 0000::/8 is reserved, and holds the deprecated IPv4-compatible form
+        // (::a.b.c.d) as well as ::1 and ::.
+        || (s[0] & 0xff00) == 0
         // fc00::/7 unique local, fe80::/10 link local.
-        || (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80
-        // 2001:db8::/32 documentation.
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        || (s[0] & 0xfe00) == 0xfc00
+        || (s[0] & 0xffc0) == 0xfe80
+        // 2001::/32 Teredo, a tunnel rather than a destination; 2001:db8::/32
+        // documentation.
+        || (s[0] == 0x2001 && (s[1] == 0 || s[1] == 0x0db8)))
 }
 
 /// A resolver that hands the connector only addresses it is allowed to dial.
@@ -146,7 +204,9 @@ pub struct GuardedResolver {
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let allow_private = self.allow_private;
+        // A host the operator named is exempt; everything else it resolves to
+        // is judged as before.
+        let allow_private = self.allow_private || host_allowed(name.as_str());
         let host = name.as_str().to_string();
         Box::pin(async move {
             // Port 0 — the connector substitutes the real one.
@@ -173,7 +233,7 @@ impl Resolve for GuardedResolver {
                     .map(|a| a.ip().to_string())
                     .unwrap_or_else(|| "no addresses".to_string());
                 return Err(format!(
-                    "{host} resolves only to non-public addresses ({detail}); set \
+                    "{host} resolves only to {REFUSAL_MARK} ({detail}); set \
                      {ALLOW_PRIVATE_ENV}=1 to allow intranet destinations"
                 )
                 .into());
