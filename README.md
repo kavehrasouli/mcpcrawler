@@ -11,6 +11,7 @@ Link depth is only a guard rail, not the main control.
 |---|---|
 | `discover` | Find candidate URLs for a topic with no seed URL, from federated sources |
 | `discover_and_crawl` | Same, then fetch the best candidates in one page budget |
+| `crawl_urls` | Read a set of URLs together — a model's own search results — as one crawl, with duplicates collapsed across the set |
 | `crawl_site` | Crawl from a URL, return the pages actually fetched (`about` to focus it) |
 | `crawl_site_same_domain` | Same, but only follows links on the seed's domain |
 | `fetch_content` | Readable text of one URL (`headless` for JS-rendered pages) |
@@ -20,7 +21,8 @@ Link depth is only a guard rail, not the main control.
 | `extract_meta` | Title, description, author, canonical URL, publish date |
 | `extract_structured_data` | schema.org JSON-LD records and embedded framework state (`__NEXT_DATA__`, Nuxt, Redux) |
 | `list_sitemap_urls` | Enumerate a site's URLs from its sitemap |
-| `login_to_site` | Log in with credentials from `passmanager` |
+| `login_to_site` | Log in with credentials from `passmanager`; the session lasts for the call only |
+| `crawler_stats` | Counters since startup: fetches, failures, retries, redirects, robots skips |
 
 ### Crawl options
 
@@ -34,6 +36,8 @@ All optional, with conservative defaults so a crawl cannot run away.
 | `per_host_delay_ms` | 500 | Minimum gap between requests to one host |
 | `respect_robots` | true | Honor `robots.txt` |
 | `seed_from_sitemap` | false | Seed the frontier from the site's sitemap |
+| `max_seconds` | 300 | Wall-clock limit; a request in flight when it passes is abandoned |
+| `render` | never | `auto` renders only a page that comes back as an empty app shell; `always` renders every page |
 
 ### Client-rendered sites
 
@@ -97,18 +101,28 @@ corroboration is recorded rather than folded into the score.
 | GDELT DOC 2.0 | no | worldwide news in 100+ languages, including syndicated regional coverage |
 | Wikidata | no | the entity's official website and every language edition of its article |
 | Wayback CDX | no | pages that were deleted and exist nowhere else |
+| Common Crawl | no | the live URLs of a site as a very large public crawl indexed it (by site, like Wayback) |
 | Brave Search | `MCPCRAWLER_BRAVE_API_KEY` | general web search — PDFs, transcripts, agendas |
+| SearXNG | `MCPCRAWLER_SEARXNG_URL` | general web search through an instance you run yourself: no account, no key, your own rate limit |
 
-Brave is registered only when its key is present in the server's environment; without it the
-other three run and it is simply absent. The key never appears in a tool schema, so it cannot
-travel through the model's context.
+Brave and SearXNG are registered only when configured; without them the others run and they are
+simply absent. A Brave key never appears in a tool schema, so it cannot travel through the
+model's context. SearXNG needs its JSON output format enabled in `settings.yml`, and an instance
+on `localhost` or a private address is reached through a one-host allowlist entry that is added
+automatically — nothing else on the private network is opened.
+
+**Naming an office.** A query that names a position — "President of Kyrgyzstan" — is resolved
+through Wikidata to the person who holds it, and the search runs on them, within their term in
+that office. The report says who it resolved to. `post` ("president") picks which of a
+person's several offices bounds the search.
 
 Sources are not the same shape. GDELT and Brave search text. Wayback searches by **site**, not
 by keyword, so it contributes only when `sites` names a host — Wikidata's official-website
 claim is one way to learn one. Wikidata takes a name and returns identity.
 
-The candidate budget is shared out by taking turns between sources rather than by global
-score, because scores are only comparable within a source. Without that, Wikidata's sixty-odd
+Scores are rescaled per source before merging — each source's best answer is 1.0 and its worst
+0.1 — so a 1.0 means "this source's top pick", not "certainly relevant". The candidate budget is
+also shared out by taking turns between sources rather than by global score. Without that, Wikidata's sixty-odd
 language editions swallow a budget of ten whole and the archive results never appear.
 
 `discover_and_crawl` does the same and then fetches, best-scoring first, under one page
@@ -214,6 +228,42 @@ that mention the subject — up to three, in reading order — so a model can re
 and who was present without fetching every page again. Lists at most 25 stories, best first.
 Nothing is extracted by the crawler itself: it hands over deduplicated, dated stories with
 their independent hosts, and reading the facts out of them is the caller's job.
+
+## Using it with a client that can search
+
+A search engine finds entry points; this finds what is behind them. If your client can search the web (Claude Code, and Claude with web search turned on, can), the division is:
+
+1. the client searches and picks URLs;
+2. `crawl_urls` reads them together — one budget, one rate limiter, near-duplicate copies collapsed, each story dated, the independent hosts named, and with `about` and `excerpts` the sentences that mention your subject;
+3. `crawl_site` with `about` follows a promising site into its archive, and `list_sitemap_urls` enumerates a site that offers no links.
+
+`discover` is for when there are no URLs yet, and depends on its sources (see below). If a source is down, the result says so and is partial; an empty result from a failed source does not mean nothing exists.
+
+## Results and errors
+
+Every tool returns prose for the model and, where it makes sense, the same facts as structured data: final URLs after redirects (`redirected_from` says where a page was asked for), `partial`, `budget_hit`, `deadline_hit`. A failure sets `isError` and carries a stable code in `structuredContent.error.code` — `bad_input`, `bad_url`, `unsupported_scheme`, `network`, `http_status`, `not_html`, `too_large`, `blocked`, `browser`, `parse`, `rate_limited`, `no_candidates`, `credentials_*`. The wording may change; the codes will not (see `CHANGELOG.md` for the compatibility rules).
+
+## Safety limits
+
+Per call: a page budget, a time limit, a per-host rate limit, `robots.txt`. Across calls: at most 32 requests in flight, 3 browser tabs and 4 crawls at once, whatever the callers ask for. Every redirect hop is checked against the destination policy, the blocked-domain list, `same_domain_only` and `robots.txt`. Decompressed sitemaps, `robots.txt`, rendered pages and XML structure are all bounded. A `robots.txt` that cannot be read because of a server error means *do not crawl that site*. The full table, with what has and has not been measured, is in [docs/performance.md](docs/performance.md).
+
+## Configuration
+
+Everything is an environment variable, validated at startup — a setting that is present and wrong stops the server with a message naming it. The table is at the top of [src/config.rs](src/config.rs):
+
+| Variable | Meaning |
+|---|---|
+| `MCPCRAWLER_ALLOW_PRIVATE_NETWORKS` | `1` permits loopback, private and link-local destinations (everything) |
+| `MCPCRAWLER_ALLOW_HOSTS` | comma-separated hosts exempt from that refusal, and only those |
+| `MCPCRAWLER_BRAVE_API_KEY` | enables the Brave Search source |
+| `MCPCRAWLER_SEARXNG_URL` | enables a self-hosted SearXNG source (its host is allowlisted automatically) |
+| `MCPCRAWLER_MASTER_PASSWORD` | master password for `login_to_site` |
+| `PASSMANAGER_PATH` | the credential helper program |
+| `MCPCRAWLER_BROWSER_NO_SANDBOX` | `1` runs Chrome without its sandbox (containers only) |
+| `CHROME` | path to Chrome or Chromium |
+| `MCPCRAWLER_LOG` | `error`, `warn`, `info` or `debug`: JSON log lines on stderr, URLs without query strings |
+
+More: [docs/deployment.md](docs/deployment.md), [docs/privacy.md](docs/privacy.md), [docs/performance.md](docs/performance.md), [CHANGELOG.md](CHANGELOG.md).
 
 ## Destinations
 
