@@ -56,6 +56,11 @@ jobs:
     name: headless browser (ignored tests)
     runs-on: ubuntu-latest
     continue-on-error: true
+    env:
+      # Hosted runners restrict the user namespaces Chrome's sandbox needs, so
+      # it cannot start with the sandbox on. Reasonable on a throwaway runner;
+      # see docs/deployment.md before doing the same anywhere else.
+      MCPCRAWLER_BROWSER_NO_SANDBOX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

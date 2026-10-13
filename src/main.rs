@@ -4,6 +4,7 @@ mod crawler;
 mod dedup;
 mod discovery;
 mod expand;
+mod html;
 mod limits;
 mod metrics;
 mod net;
@@ -22,8 +23,28 @@ use tools::Crawler;
 #[cfg(test)]
 mod tests;
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+/// Worker threads get 8 MiB of stack, not tokio's 2 MiB. Pages are parsed on
+/// them, and a recursion that is fine at 2 MiB on one platform is not on
+/// another (Windows frames are larger). The parser guard and iterative walks
+/// are the real defence; this is margin behind them.
+const WORKER_STACK: usize = 8 * 1024 * 1024;
+
+fn main() -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK)
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("mcpcrawler: could not start the async runtime: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(run())
+}
+
+async fn run() -> std::process::ExitCode {
     // A setting that is present and wrong is an error now, not a surprise later.
     net::init_allowed_hosts_from_env();
     if let Err(problems) = config::validate() {

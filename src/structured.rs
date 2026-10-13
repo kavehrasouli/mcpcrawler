@@ -9,7 +9,7 @@
 //! that yields records rather than prose.
 
 use crate::crawler::{canonicalize, dedup_key};
-use scraper::{Html, Selector};
+use scraper::Selector;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -96,7 +96,7 @@ impl StructuredData {
 pub fn extract(html: &str) -> StructuredData {
     static SCRIPT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("script").unwrap());
 
-    let document = Html::parse_document(html);
+    let document = crate::html::parse(html);
     let mut json_ld = Vec::new();
     let mut embedded: Vec<EmbeddedState> = Vec::new();
 

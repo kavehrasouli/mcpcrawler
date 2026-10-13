@@ -31,6 +31,7 @@ Tool schemas are versioned with the crate. The rules:
 - `login_to_site` sessions no longer persist after the call.
 
 ### Fixed
+- **A page nested deeply enough crashed the whole server.** About 20,000 nested elements (under 100 KB) overflowed a worker thread's stack, which aborts the process; and the parser's time grows with the square of the depth, so 200,000 levels held a core for minutes. Pages nested more than 512 levels are now refused before parsing, with a `parse` error and a reason; the text walk is iterative; markdown conversion is not attempted on such pages; workers have 8 MiB stacks. Found when the first Windows CI run died on the old hostile-markup test. Regression tests: `a_hostile_depth_yields_nothing_quickly…`, `a_hostile_page_fails_that_one_fetch…`.
 - **SIGTERM left the server hung and Chrome running.** Returning from `main` waited on tokio's blocking stdin read, which does not finish while the client still holds the pipe. The process now exits explicitly once the browser is closed, and closing is bounded and falls back to killing Chrome. Regression test: `tests/shutdown.rs`.
 - A destination refused by the network guard was reported as "skipped by robots.txt"; it is now reported as refused.
 - `render=auto` opened a browser tab for any short page with no links; it now needs an app mount point or script bundle as well.

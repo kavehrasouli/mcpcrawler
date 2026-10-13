@@ -423,7 +423,21 @@ async fn html_body(response: reqwest::Response, max: usize) -> Result<String, Cr
         return Err(CrawlError::ContentType(content_type));
     }
     let body = read_limited(response, max).await?;
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    let html = String::from_utf8_lossy(&body).into_owned();
+    refuse_if_too_deep(&html)?;
+    Ok(html)
+}
+
+/// A page nested past the limit is refused with a reason, rather than read as
+/// an empty page — see [`crate::html`].
+fn refuse_if_too_deep(html: &str) -> Result<(), CrawlError> {
+    if crate::html::too_deep(html) {
+        return Err(CrawlError::Parse(format!(
+            "the page is nested more than {} levels deep, which no real page is; refused",
+            crate::html::MAX_NESTING
+        )));
+    }
+    Ok(())
 }
 
 /// Redirect hops a crawl will follow before giving up on a URL.
@@ -644,6 +658,7 @@ async fn read_dom(page: &chromiumoxide::page::Page) -> Result<String, CrawlError
     if html.len() > limits::MAX_DOM_BYTES {
         return Err(CrawlError::TooLarge(limits::MAX_DOM_BYTES));
     }
+    refuse_if_too_deep(&html)?;
     Ok(html)
 }
 
@@ -1261,7 +1276,7 @@ static APP_MARKERS: LazyLock<Selector> = LazyLock::new(|| {
 /// (`#root`, `#app`, `#__next`…) or a script bundle — so all three are asked
 /// for, and a small ordinary page does not cost a browser tab.
 pub(crate) fn looks_unrendered_html(html: &str, base: &Url) -> bool {
-    let document = Html::parse_document(html);
+    let document = crate::html::parse(html);
     links_in(&document, base).is_empty()
         && text_of(&document).chars().count() < 200
         && document.select(&APP_MARKERS).next().is_some()
@@ -1757,7 +1772,7 @@ static MAIN_SELECTORS: LazyLock<Vec<Selector>> = LazyLock::new(|| {
 });
 
 pub fn extract_links(html: &str, base: &Url) -> Vec<Url> {
-    links_in(&Html::parse_document(html), base)
+    links_in(&crate::html::parse(html), base)
         .into_iter()
         .map(|link| link.url)
         .collect()
@@ -1772,7 +1787,7 @@ pub struct PageAnalysis {
 }
 
 pub fn analyse(html: &str, base: &Url) -> PageAnalysis {
-    let document = Html::parse_document(html);
+    let document = crate::html::parse(html);
     PageAnalysis { links: links_in(&document, base), text: text_of(&document) }
 }
 
@@ -1842,27 +1857,40 @@ fn trimmed_text<'a>(parts: impl Iterator<Item = &'a str>, limit: usize) -> Strin
     out
 }
 
-fn collect_text(node: ego_tree::NodeRef<'_, Node>, out: &mut String) {
-    for child in node.children() {
-        match child.value() {
-            Node::Element(el) => {
-                let name = el.name();
-                if SKIP_TAGS.contains(&name) {
-                    continue;
+fn collect_text(root: ego_tree::NodeRef<'_, Node>, out: &mut String) {
+    // Walked with a stack of its own rather than by recursion: a page nested
+    // deeply enough overflows the thread's stack, and a stack overflow aborts
+    // the whole process. Each entry is an iterator over one element's children,
+    // and the element's name, so its block break can be added when it is done.
+    let mut stack = vec![(root.children(), None::<&str>)];
+    loop {
+        let Some((children, _)) = stack.last_mut() else { return };
+        match children.next() {
+            Some(child) => match child.value() {
+                Node::Element(el) => {
+                    let name = el.name();
+                    if !SKIP_TAGS.contains(&name) {
+                        stack.push((child.children(), Some(name)));
+                    }
                 }
-                collect_text(child, out);
-                if BLOCK_TAGS.contains(&name) && !out.ends_with('\n') {
+                Node::Text(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(trimmed);
+                        out.push(' ');
+                    }
+                }
+                _ => {}
+            },
+            None => {
+                let closed = stack.pop().and_then(|(_, name)| name);
+                if let Some(name) = closed
+                    && BLOCK_TAGS.contains(&name)
+                    && !out.ends_with('\n')
+                {
                     out.push('\n');
                 }
             }
-            Node::Text(text) => {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    out.push_str(trimmed);
-                    out.push(' ');
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -1871,7 +1899,7 @@ fn collect_text(node: ego_tree::NodeRef<'_, Node>, out: &mut String) {
 /// whole `<body>` gave every page on a site a large identical block of text,
 /// which would poison both relevance scoring and duplicate detection.
 pub fn extract_text(html: &str) -> String {
-    text_of(&Html::parse_document(html))
+    text_of(&crate::html::parse(html))
 }
 
 fn text_of(document: &Html) -> String {
@@ -1895,6 +1923,11 @@ fn text_of(document: &Html) -> String {
 }
 
 pub fn extract_text_md(html: &str) -> String {
+    // The converter recurses over the document; past the nesting limit it is
+    // not called at all.
+    if crate::html::too_deep(html) {
+        return String::new();
+    }
     htmd::convert(html).unwrap_or_default()
 }
 
@@ -1906,7 +1939,7 @@ static PUBLISHED: LazyLock<Selector> = LazyLock::new(|| {
 /// `<time>` element first; the JSON-LD record for pages that render client-side
 /// and carry nothing else. Normalising the format is the caller's business.
 pub fn published_raw(html: &str) -> Option<String> {
-    let document = Html::parse_document(html);
+    let document = crate::html::parse(html);
     document
         .select(&PUBLISHED)
         .next()
@@ -1932,7 +1965,7 @@ pub fn extract_metadata(html: &str) -> String {
     static CANONICAL: LazyLock<Selector> =
         LazyLock::new(|| Selector::parse("link[rel='canonical']").unwrap());
 
-    let document = Html::parse_document(html);
+    let document = crate::html::parse(html);
 
     let content = |sel: &Selector| -> String {
         document

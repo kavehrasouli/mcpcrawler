@@ -17,6 +17,7 @@
 | Sitemap files read | 50 (exact) | `max_sitemaps` |
 | `robots.txt` | read to 512 KiB | longer is truncated |
 | Rendered DOM | 20 MiB | per page |
+| HTML nesting | 512 levels (deeper is refused, not parsed) | per page |
 | XML | 64 levels deep, 5,000,000 events | per document |
 | URLs per `crawl_urls` call | 200 | |
 

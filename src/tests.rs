@@ -480,6 +480,12 @@ async fn fixture() -> Fixture {
                         let filler = format!("Report {n} on the delegation, the talks and the agreements signed. ").repeat(25);
                         (200, "text/html", format!("<html><body><main><p>{filler}</p>{children}</main></body></html>").into_bytes())
                     }
+                    // Nested far past anything a person writes.
+                    "/deep" => (
+                        200,
+                        "text/html",
+                        format!("<html><body>{}hello{}</body></html>", "<div>".repeat(100_000), "</div>".repeat(100_000)).into_bytes(),
+                    ),
                     "/redir-rel" => {
                         extra = "Location: /alpha\r\n".into();
                         (302, "text/html", Vec::new())
@@ -3620,4 +3626,94 @@ async fn a_destination_the_guard_refuses_is_reported_as_refused_not_as_robots() 
         .map(|e| e.to_string())
         .unwrap_or_default();
     assert!(err.contains(net::REFUSAL_MARK), "got {err:?}");
+}
+
+// *** deep nesting ***
+//
+// A page nested twenty thousand levels deep crashed the whole server with a
+// stack overflow, and one nested two hundred thousand deep held a core for
+// minutes: the parser slows with the square of the depth. Found when the
+// Windows CI run died on the old hostile-markup test, whose 5,000 levels
+// happened to fit on a Mac.
+
+fn nested(depth: usize) -> String {
+    format!("<html><body>{}hello{}</body></html>", "<div>".repeat(depth), "</div>".repeat(depth))
+}
+
+#[test]
+fn nesting_is_measured_without_being_fooled_by_what_a_parser_would_skip() {
+    use crate::html::{MAX_NESTING, too_deep};
+    // Ordinary and generous pages are fine.
+    assert!(!too_deep(&nested(100)));
+    // `nested` adds <html> and <body> around its divs, and they count too.
+    assert!(!too_deep(&nested(MAX_NESTING - 2)));
+    assert!(too_deep(&nested(MAX_NESTING - 1)));
+
+    // Elements with optional end tags never nest, however many are left open.
+    assert!(!too_deep(&format!("<ul>{}</ul>", "<li>item ".repeat(5_000))));
+    assert!(!too_deep(&format!("<table>{}</table>", "<tr><td>cell ".repeat(5_000))));
+    assert!(!too_deep(&"<p>paragraph ".repeat(5_000)));
+    // Void elements have no end tag at all.
+    assert!(!too_deep(&"<br>text<img src=x><hr>".repeat(5_000)));
+    // Markup inside a script, a style or a comment is not markup.
+    assert!(!too_deep(&format!("<script>{}</script>", "<div>".repeat(5_000))));
+    assert!(!too_deep(&format!("<style>{}</style>", "<div>".repeat(5_000))));
+    assert!(!too_deep(&format!("<!-- {} -->", "<div>".repeat(5_000))));
+    // A `>` inside a quoted attribute does not end the tag early.
+    assert!(!too_deep(&"<a title=\"x > <div><div><div>\">link</a>".repeat(2_000)));
+    // And a stray quote in an unquoted value cannot swallow the tags after it.
+    assert!(too_deep(&format!("{}{}", "<div x=a'b>".repeat(MAX_NESTING + 1), "hello")));
+    // Self-closing and closed-again markup balances.
+    assert!(!too_deep(&"<div></div>".repeat(5_000)));
+    assert!(!too_deep(&"<span/>".repeat(5_000)));
+}
+
+#[test]
+fn a_hostile_depth_yields_nothing_quickly_instead_of_crashing_or_stalling() {
+    let started = std::time::Instant::now();
+    let html = nested(200_000);
+    let base = Url::parse("https://example.org/").unwrap();
+
+    assert_eq!(extract_text(&html), "");
+    assert!(extract_links(&html, &base).is_empty());
+    assert_eq!(analyse(&html, &base).text, "");
+    assert_eq!(extract_text_md(&html), "");
+    assert!(structured::extract(&html).is_empty());
+    let _ = extract_metadata(&html);
+    // Two hundred thousand levels used to take minutes to parse.
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn deep_but_legitimate_nesting_is_still_read_on_a_small_stack() {
+    // The deepest page accepted, on a thread with a quarter of the usual
+    // stack: the walk is iterative and the markdown converter is not called on
+    // anything deeper than the limit, so this must not overflow.
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let html = nested(crate::html::MAX_NESTING - 10);
+            assert!(extract_text(&html).contains("hello"));
+            let base = Url::parse("https://example.org/").unwrap();
+            assert!(analyse(&html, &base).text.contains("hello"));
+        })
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn a_hostile_page_fails_that_one_fetch_and_the_crawl_carries_on() {
+    let server = fixture().await;
+    let seeds: Vec<Seed> = ["/deep", "/alpha"]
+        .iter()
+        .map(|p| Seed::new(canonicalize(&server.url(p)).unwrap(), Origin::Seed))
+        .collect();
+    let outcome = crawl_from(&test_client(), seeds, &shallow()).await.unwrap();
+
+    // The ordinary page was read.
+    assert_eq!(outcome.pages.len(), 1);
+    assert!(outcome.pages[0].url.as_str().ends_with("/alpha"));
+    // The hostile one was refused, with a reason.
+    let why = &outcome.failed.iter().find(|(u, _)| u.ends_with("/deep")).unwrap().1;
+    assert!(why.contains("nested more than"), "got {why}");
 }
